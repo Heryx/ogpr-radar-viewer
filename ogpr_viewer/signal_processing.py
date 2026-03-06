@@ -5,7 +5,7 @@ Implements GPR processing algorithms described in:
   Goodman & Piro (2013) GPR Remote Sensing in Archaeology, Chapter 3.
 
 Pipeline (in recommended order):
-  1.  Time-Zero Correction        - align first breaks
+  1.  Time-Zero Correction        - align first breaks, crop pre-trigger
   2.  Dewow                       - remove low-freq DC drift along each trace
   3.  Background Removal          - subtract mean/median trace (global or rolling)
   4.  Bandpass Filter             - Butterworth band-pass in frequency domain
@@ -94,12 +94,18 @@ class SignalProcessor:
         threshold: float = 0.1,
     ) -> np.ndarray:
         """
-        Align all traces to a common first-break (time-zero).
+        Align all traces to a common first-break (time-zero) and crop
+        the pre-trigger region.
 
-        The first-break in each trace is detected either as the first sample
-        exceeding `threshold` * max_amplitude ('threshold') or as the sample
-        of maximum absolute amplitude ('max').  Traces are then shifted so
-        that all first-breaks coincide with the median first-break sample.
+        Steps:
+          1. Detect the first-break sample in each trace:
+             - 'threshold': first sample exceeding threshold * max_amplitude
+             - 'max':       sample of maximum absolute amplitude
+          2. Shift all traces so every first-break aligns to the median
+             first-break position.
+          3. Crop the profile: remove the first med samples (pre-trigger
+             noise / air gap before the antenna fires).  After this step
+             the profile starts at t = 0 (first break = surface).
         """
         data     = self.processed_data
         n_smp    = data.shape[0]
@@ -119,11 +125,18 @@ class SignalProcessor:
         out = np.zeros_like(data)
         for i in range(n_trc):
             shift = med - tz[i]
-            if   shift > 0: out[shift:,   i] = data[: n_smp - shift, i]
-            elif shift < 0: out[: n_smp + shift, i] = data[-shift:, i]
+            if   shift > 0: out[shift:,         i] = data[: n_smp - shift, i]
+            elif shift < 0: out[: n_smp + shift, i] = data[-shift:,        i]
             else:           out[:, i] = data[:, i]
 
-        LOG.debug(f'Time-zero: median={med} shift_range=[{tz.min()},{tz.max()}]')
+        # Crop pre-trigger: remove samples 0..med-1 so profile starts at t=0
+        if med > 0:
+            out = out[med:, :]
+
+        LOG.debug(
+            f'Time-zero: median={med} shift_range=[{tz.min()},{tz.max()}] '
+            f'cropped={med} samples  new_shape={out.shape}'
+        )
         self.processed_data = out
         return out
 
@@ -135,10 +148,6 @@ class SignalProcessor:
         """
         Remove 'wow' (low-frequency DC drift) from each trace by
         subtracting a moving average of length `window_size` samples.
-
-        Goodman & Piro (2013) recommend window = 3-5 × pulse length.
-        For a 600 MHz antenna sampled at ~0.117 ns the pulse is ~10 samples,
-        so 50 samples (default) is a safe minimum.
         """
         data = self.processed_data.copy()
         w    = max(3, int(window_size))
@@ -163,16 +172,15 @@ class SignalProcessor:
         window_traces: int   = 50,
     ) -> np.ndarray:
         """
-        Remove background horizontal banding.
+        Remove background horizontal banding (including the direct wave).
 
         Global mode  (rolling=False):
-            Compute one mean/median trace over ALL traces and subtract it.
-            Best for static antenna noise present throughout the profile.
+            Subtract the mean/median trace over ALL traces.
+            Effectively removes the direct wave and static antenna pattern.
 
         Rolling mode (rolling=True):
-            Compute mean/median within a sliding window of `window_traces`
-            traces centred at each trace and subtract locally.
-            Better for non-stationary background that drifts along the profile.
+            Subtract a locally computed mean/median within a sliding window.
+            Better for non-stationary background.
         """
         data = self.processed_data.copy()
         n_trc = data.shape[1]
@@ -190,10 +198,7 @@ class SignalProcessor:
                 lo  = max(0,     i - half)
                 hi  = min(n_trc, i + half)
                 win = data[:, lo:hi]
-                if method == 'mean':
-                    bg = np.mean(win, axis=1)
-                else:
-                    bg = np.median(win, axis=1)
+                bg  = np.mean(win, axis=1) if method == 'mean' else np.median(win, axis=1)
                 out[:, i] = data[:, i] - bg
             data = out
 
@@ -213,9 +218,6 @@ class SignalProcessor:
     ) -> np.ndarray:
         """
         Apply a zero-phase Butterworth bandpass filter along each trace.
-
-        Frequencies outside [low_freq, high_freq] MHz are attenuated.
-        Uses sosfiltfilt for zero-phase (no group-delay distortion).
         """
         nyq  = self.sampling_freq_mhz / 2.0
         lo   = float(np.clip(low_freq  / nyq, 1e-4, 0.9999))
@@ -238,7 +240,7 @@ class SignalProcessor:
         return self.processed_data
 
     # ------------------------------------------------------------------
-    # 5. Notch Filter  (single interference frequency)
+    # 5. Notch Filter
     # ------------------------------------------------------------------
 
     def apply_notch(
@@ -248,11 +250,7 @@ class SignalProcessor:
         order:         int   = 2,
     ) -> np.ndarray:
         """
-        Remove a single narrowband interference frequency (e.g. 50 MHz
-        power-line noise, antenna ringing).
-
-        Implements a notch (band-stop) Butterworth filter centred at
-        `freq_mhz` with ± bandwidth_mhz/2 stopband.
+        Remove a single narrowband interference frequency.
         """
         nyq   = self.sampling_freq_mhz / 2.0
         lo    = float(np.clip((freq_mhz - bandwidth_mhz / 2) / nyq, 1e-4, 0.9999))
@@ -285,32 +283,16 @@ class SignalProcessor:
         eps:     float = 1e-6,
     ) -> np.ndarray:
         """
-        Spectral whitening (Goodman & Piro 2013, §3.3).
-
-        For each trace:
-          1. FFT -> complex spectrum  X(f)
-          2. Divide by |X(f)| + eps  so all spectral magnitudes = 1
-          3. Optional bandpass mask applied in the frequency domain
-          4. IFFT -> whitened trace
-
-        Effect: equalises amplitude across all frequencies, boosting
-        weak deep reflections while preserving phase information.
-        Particularly valuable for multi-channel / multi-antenna data.
-
-        Args:
-            bp_low, bp_high: Optional bandpass limits [MHz] applied
-                             simultaneously in the spectral domain.
-            eps:             Small constant to prevent division by zero.
+        Spectral whitening: equalise amplitude across all frequencies.
         """
         data   = self.processed_data.copy()
         n_smp  = data.shape[0]
-        freqs  = np.fft.rfftfreq(n_smp, d=self.sampling_time_ns)  # [1/ns = GHz]
-        freqs_mhz = freqs * 1000.0  # -> MHz
+        freqs  = np.fft.rfftfreq(n_smp, d=self.sampling_time_ns)
+        freqs_mhz = freqs * 1000.0
 
-        # Build optional bandpass mask in frequency domain
         if bp_low is not None or bp_high is not None:
-            lo  = bp_low  if bp_low  is not None else 0.0
-            hi  = bp_high if bp_high is not None else freqs_mhz[-1]
+            lo   = bp_low  if bp_low  is not None else 0.0
+            hi   = bp_high if bp_high is not None else freqs_mhz[-1]
             mask = ((freqs_mhz >= lo) & (freqs_mhz <= hi)).astype(np.float32)
         else:
             mask = np.ones(len(freqs_mhz), dtype=np.float32)
@@ -322,9 +304,7 @@ class SignalProcessor:
             spec_white *= mask
             data[:, i] = np.fft.irfft(spec_white, n=n_smp).astype(np.float32)
 
-        LOG.debug(
-            f'Spectral whitening: bp=[{bp_low},{bp_high}] MHz'
-        )
+        LOG.debug(f'Spectral whitening: bp=[{bp_low},{bp_high}] MHz')
         self.processed_data = data
         return data
 
@@ -345,29 +325,25 @@ class SignalProcessor:
 
         gain_type='exp'
             g(t) = exp(factor * t/t_max)
-            Simple exponential amplification normalised to the trace length.
 
         gain_type='linear'
             g(t) = 1 + factor * t/t_max
 
-        gain_type='sec'  ← recommended for GPR (Goodman & Piro 2013)
-            SEC = Spreading & Exponential Compensation.
-            Compensates for:
-              • Geometric spherical spreading  proportional to r² ∝ t²
-              • Exponential dielectric absorption  ∝ exp(alpha * t)
-            g(t) = t² * exp(alpha * t),  for t >= t_start_ns
-            This is the physically correct gain for ground wave attenuation.
+        gain_type='sec'  <- recommended (Goodman & Piro 2013)
+            g(t) = t^2 * exp(alpha * t),  t >= t_start_ns
+            Compensates for geometric spreading and dielectric absorption.
 
         gain_type='agc'
-            Automatic Gain Control: normalise each sample by the RMS
-            amplitude of its local window.  Non-physical but useful for
-            visual inspection when subsurface contrast is very low.
+            Normalise each sample by the local RMS within window_ns.
+            t_start_ns: samples before this time are NOT gain-corrected
+            (protects the direct wave / surface reflection).
 
         Args:
             factor:     Multiplier for exp/linear gain.
             alpha:      Absorption coefficient [1/ns] for SEC.
-            t_start_ns: Delay before gain is applied [ns] (skip air wave).
-            window_ns:  AGC window half-length [ns].
+            t_start_ns: Delay before gain starts [ns].
+                        For AGC: direct wave region is left unchanged.
+            window_ns:  AGC window length [ns].
         """
         data  = self.processed_data.copy()
         n_smp = data.shape[0]
@@ -381,29 +357,35 @@ class SignalProcessor:
             g = 1.0 + factor * t / t_max
 
         elif gain_type == 'sec':
-            # SEC: t^2 * exp(alpha * t), zero before t_start_ns
             t_shifted = np.maximum(t - t_start_ns, 0.0)
             with np.errstate(over='ignore'):
                 g = (t_shifted ** 2) * np.exp(alpha * t_shifted)
-            # Normalise so that gain at t_max = 1e6 (avoid infinity)
             g_max = float(g.max())
             if g_max > 0:
                 g = g / g_max * 1e4
             g[t < t_start_ns] = 1.0
 
         elif gain_type == 'agc':
-            win_smp = max(3, int(window_ns / self.sampling_time_ns))
-            out     = data.copy()
-            # Vectorised RMS via uniform_filter1d for speed
             from scipy.ndimage import uniform_filter1d
-            for i in range(data.shape[1]):
-                rms = np.sqrt(
-                    uniform_filter1d(data[:, i] ** 2, size=win_smp, mode='reflect')
-                )
-                rms = np.where(rms < 1e-10, 1e-10, rms)
-                out[:, i] = data[:, i] / rms
-            self.processed_data = out.astype(np.float32)
-            LOG.debug(f'AGC: window={window_ns} ns ({win_smp} smp)')
+            win_smp   = max(3, int(window_ns / self.sampling_time_ns))
+            start_smp = max(0, int(t_start_ns / self.sampling_time_ns))
+
+            # Vectorised RMS across all traces simultaneously (axis=0)
+            rms = np.sqrt(
+                uniform_filter1d(data ** 2, size=win_smp, axis=0, mode='nearest')
+            )
+            rms = np.where(rms < 1e-10, 1e-10, rms)
+            out = (data / rms).astype(np.float32)
+
+            # Protect the direct wave / pre-start region: keep original values
+            if start_smp > 0:
+                out[:start_smp, :] = data[:start_smp, :].astype(np.float32)
+
+            self.processed_data = out
+            LOG.debug(
+                f'AGC: window={window_ns} ns ({win_smp} smp)  '
+                f't_start={t_start_ns} ns (protected {start_smp} smp)'
+            )
             return self.processed_data
 
         else:
@@ -423,10 +405,7 @@ class SignalProcessor:
     def apply_hilbert(self) -> np.ndarray:
         """
         Replace each trace with its instantaneous amplitude (envelope)
-        computed via the Hilbert transform.
-
-        Useful for detecting reflection boundaries independent of polarity.
-        (Goodman & Piro 2013, §3.6)
+        via the Hilbert transform.  (Goodman & Piro 2013, §3.6)
         """
         data = self.processed_data.copy()
         for i in range(data.shape[1]):
@@ -483,26 +462,6 @@ class SignalProcessor:
         """
         2-D diffraction-stack (Kirchhoff) migration.
         (Goodman & Piro 2013, §3.5)
-
-        For each output point (sample i, trace j), sums the input data
-        along the diffraction hyperbola defined by:
-
-            t(x) = sqrt( t0^2 + (2*(x - x0) / v)^2 )
-
-        where:
-            t0  = i * dt          two-way time at apex  [ns]
-            x0  = j * dx          apex horizontal position  [m]
-            v   = velocity_m_ns   subsurface velocity  [m/ns]
-            dx  = trace_spacing_m
-
-        Args:
-            velocity_m_ns:   EM velocity in medium [m/ns].
-                             Typical ranges:
-                               dry sand/gravel : 0.12–0.15
-                               moist soil      : 0.08–0.10
-                               wet clay        : 0.05–0.07
-            aperture_traces: Half-aperture in traces over which to sum.
-                             Wider = more complete migration, slower.
         """
         data   = self.processed_data.copy()
         n_smp, n_trc = data.shape
@@ -518,17 +477,16 @@ class SignalProcessor:
 
         for j0 in range(n_trc):
             for i0 in range(n_smp):
-                t0      = i0 * dt          # apex two-way time [ns]
-                x0      = j0 * dx          # apex position [m]
-                acc     = 0.0
-                n_used  = 0
-
-                j_lo = max(0,     j0 - aperture_traces)
-                j_hi = min(n_trc, j0 + aperture_traces + 1)
+                t0     = i0 * dt
+                x0     = j0 * dx
+                acc    = 0.0
+                n_used = 0
+                j_lo   = max(0,     j0 - aperture_traces)
+                j_hi   = min(n_trc, j0 + aperture_traces + 1)
 
                 for j in range(j_lo, j_hi):
                     x      = j * dx
-                    offset = 2.0 * (x - x0) / v  # [ns]
+                    offset = 2.0 * (x - x0) / v
                     t      = np.sqrt(t0 ** 2 + offset ** 2)
                     i_frac = t / dt
                     i_lo   = int(i_frac)
@@ -550,20 +508,17 @@ class SignalProcessor:
     # Power spectrum  (for GUI inspector)
     # ------------------------------------------------------------------
 
-    def get_power_spectrum(
-        self,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    def get_power_spectrum(self) -> Tuple[np.ndarray, np.ndarray]:
         """
         Compute the mean power spectrum of the current processed data.
 
         Returns:
             (frequencies_mhz, mean_power_db)
-            Suitable for plotting to choose bandpass cutoffs visually.
         """
         data  = self.processed_data
         n_smp = data.shape[0]
         specs = np.abs(np.fft.rfft(data, axis=0)) ** 2
-        mean_power = specs.mean(axis=1)  # average over traces
+        mean_power    = specs.mean(axis=1)
         mean_power_db = 10.0 * np.log10(mean_power + 1e-30)
-        freqs_mhz = np.fft.rfftfreq(n_smp, d=self.sampling_time_ns) * 1000.0
+        freqs_mhz     = np.fft.rfftfreq(n_smp, d=self.sampling_time_ns) * 1000.0
         return freqs_mhz.astype(np.float32), mean_power_db.astype(np.float32)
