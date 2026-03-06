@@ -16,6 +16,7 @@ Velocity is a single global parameter shared between:
   - Kirchhoff migration
 """
 
+import csv
 import sys
 import logging
 import traceback
@@ -82,9 +83,9 @@ class FileLoaderThread(QThread):
     def run(self):
         try:
             LOG.debug(f'Loading: {self.filepath}  lazy={self.lazy}')
-            self.progress.emit('Parsing header…')
+            self.progress.emit('Parsing header\u2026')
             parser = OGPRParser(self.filepath)
-            self.progress.emit('Loading radar volume…')
+            self.progress.emit('Loading radar volume\u2026')
             d = parser.load_data(lazy=self.lazy)
             LOG.info(
                 f'OK {Path(self.filepath).name}  '
@@ -167,7 +168,7 @@ class PowerSpectrumDialog(QDialog):
         ax.plot(freqs, power_db, color='#00aaff', linewidth=1.2)
         ax.set_xlabel('Frequency (MHz)', color='#cccccc', fontsize=9)
         ax.set_ylabel('Power (dB)',      color='#cccccc', fontsize=9)
-        ax.set_title('Mean Trace Power Spectrum – use to set Bandpass cutoffs',
+        ax.set_title('Mean Trace Power Spectrum \u2013 use to set Bandpass cutoffs',
                      color='white', fontsize=9, fontweight='bold')
         ax.tick_params(colors='#aaaaaa', labelsize=8)
         for sp in ax.spines.values(): sp.set_edgecolor('#555555')
@@ -249,7 +250,7 @@ class OGPRViewerMainWindow(QMainWindow):
         scroll.setWidget(self._sidebar_inner)
         v.addWidget(scroll)
 
-        btn = QPushButton('\u2795  Open file(s)…')
+        btn = QPushButton('\u2795  Open file(s)\u2026')
         btn.clicked.connect(self.open_files)
         v.addWidget(btn)
         return c
@@ -272,7 +273,6 @@ class OGPRViewerMainWindow(QMainWindow):
         hdr.setFont(QFont('', 9, QFont.Weight.Bold))
         layout.addWidget(hdr)
 
-        # Processing groups
         layout.addWidget(self._grp_timezero())
         layout.addWidget(self._grp_dewow())
         layout.addWidget(self._grp_background())
@@ -283,7 +283,6 @@ class OGPRViewerMainWindow(QMainWindow):
         layout.addWidget(self._grp_hilbert_norm())
         layout.addWidget(self._grp_migration())
 
-        # Display (colormap + Y-axis + velocity)
         layout.addWidget(self._grp_display())
         layout.addWidget(self._grp_export())
         layout.addStretch()
@@ -355,6 +354,9 @@ class OGPRViewerMainWindow(QMainWindow):
         self._combo(v, '  Method:', 'bg_method', ['mean', 'median'])
         self._cb(v, '  Rolling window', 'cb_bg_rolling')
         self._ispin(v, '  Win traces:', 'bg_win_traces', 5, 500, 50, ' trc')
+        # Per-trace equalization: divides each trace by its RMS to remove
+        # vertical stripes caused by amplitude heterogeneity between traces.
+        self._cb(v, '  Per-trace equalization', 'cb_bg_pertrace')
         g.setLayout(v); return g
 
     def _grp_bandpass(self):
@@ -363,7 +365,7 @@ class OGPRViewerMainWindow(QMainWindow):
         self._dspin(v, '  Low:',   'bp_low',   1.0, 4000.0, 100.0, 10.0, ' MHz')
         self._dspin(v, '  High:',  'bp_high',  1.0, 4000.0, 800.0, 10.0, ' MHz')
         self._ispin(v, '  Order:', 'bp_order', 1, 8, 4)
-        btn = QPushButton('\U0001f4c8  Power spectrum…')
+        btn = QPushButton('\U0001f4c8  Power spectrum\u2026')
         btn.clicked.connect(self._show_power_spectrum)
         v.addWidget(btn)
         g.setLayout(v); return g
@@ -386,10 +388,14 @@ class OGPRViewerMainWindow(QMainWindow):
         self._cb(v, 'Enable', 'cb_gain')
         self._combo(v, '  Type:', 'gain_type', ['sec', 'exp', 'linear', 'agc'])
         v.addWidget(QLabel(
-            '<small><i>SEC = Spreading &amp; Exponential Compensation</i></small>'
+            '<small><i>SEC = Spreading &amp; Exponential Compensation<br>'
+            'Factor controls max gain (factor\u00d7200) for SEC</i></small>'
         ))
-        self._dspin(v, '  Factor (exp/lin):',    'gain_factor', 0.1, 20.0, 2.0, 0.1)
-        self._dspin(v, '  α (SEC) [1/ns]:',      'gain_alpha',  0.0,  5.0, 0.5, 0.05)
+        self._dspin(v, '  Factor (exp/lin/sec):',  'gain_factor', 0.1, 20.0, 2.0, 0.1)
+        # alpha default changed from 0.5 to 0.05 ns^-1.
+        # 0.5 ns^-1 caused g(60ns) ~ 10^16 -> saturation even after normalisation.
+        # Typical GPR soil attenuation: 0.01 – 0.10 ns^-1.
+        self._dspin(v, '  \u03b1 (SEC) [1/ns]:',      'gain_alpha',  0.0,  2.0, 0.05, 0.01)
         self._dspin(v, '  t-start (SEC) [ns]:', 'gain_tstart', 0.0, 100.0, 0.0, 0.5, ' ns')
         self._dspin(v, '  AGC window:',          'gain_agc_win',1.0, 500.0, 50.0, 5.0, ' ns')
         g.setLayout(v); return g
@@ -405,7 +411,7 @@ class OGPRViewerMainWindow(QMainWindow):
         g = QGroupBox('Kirchhoff Migration'); v = QVBoxLayout()
         self._cb(v, 'Enable', 'cb_mig')
         v.addWidget(QLabel(
-            '<small><i>Uses the velocity set in Display ↓</i></small>'
+            '<small><i>Uses the velocity set in Display \u2193</i></small>'
         ))
         self._ispin(v, '  Aperture:', 'mig_aperture', 5, 200, 30, ' trc')
         g.setLayout(v); return g
@@ -417,19 +423,17 @@ class OGPRViewerMainWindow(QMainWindow):
     def _grp_display(self):
         g = QGroupBox('Display'); v = QVBoxLayout()
 
-        # Colormap
         self._combo(v, 'Colormap:', 'cmap_combo',
                     ['gray', 'seismic', 'RdBu_r', 'viridis', 'jet', 'hot', 'bwr'])
 
         v.addWidget(_hsep())
 
-        # --- Y-axis mode ---
         v.addWidget(QLabel('Y axis:'))
         self.ymode_grp = QButtonGroup(self)
         for label, mode in [
             ('Time (ns)',           'time'),
-            ('Depth – relative (m)', 'depth_rel'),
-            ('Depth – absolute (m)', 'depth_abs'),
+            ('Depth \u2013 relative (m)', 'depth_rel'),
+            ('Depth \u2013 absolute (m)', 'depth_abs'),
         ]:
             rb = QRadioButton(label)
             rb.setProperty('ymode', mode)
@@ -442,11 +446,10 @@ class OGPRViewerMainWindow(QMainWindow):
 
         v.addWidget(_hsep())
 
-        # --- Velocity  (shared by depth conversion + migration) ---
         v.addWidget(QLabel('EM Velocity  [m/ns]:'))
         v.addWidget(QLabel(
-            '<small>dry sand 0.12–0.15 · moist soil 0.08–0.10<br>'
-            'wet clay 0.05–0.07 · concrete 0.10–0.12</small>'
+            '<small>dry sand 0.12\u20130.15 \u00b7 moist soil 0.08\u20130.10<br>'
+            'wet clay 0.05\u20130.07 \u00b7 concrete 0.10\u20130.12</small>'
         ))
         row = QHBoxLayout()
         self.velocity_spin = QDoubleSpinBox()
@@ -469,9 +472,20 @@ class OGPRViewerMainWindow(QMainWindow):
 
     def _grp_export(self):
         g = QGroupBox('Export'); v = QVBoxLayout()
-        btn = QPushButton('Export current view…')
+
+        btn = QPushButton('Export current view\u2026')
         btn.clicked.connect(self._export)
         v.addWidget(btn)
+
+        btn_dbg = QPushButton('\U0001f41b  Debug: export trace stats\u2026')
+        btn_dbg.setToolTip(
+            'Export a CSV with per-trace statistics (rms, max, mean, std)\n'
+            'for every visible swath after the full processing pipeline.\n'
+            'Use this to diagnose amplitude heterogeneity / vertical stripes.'
+        )
+        btn_dbg.clicked.connect(self._export_debug)
+        v.addWidget(btn_dbg)
+
         g.setLayout(v); return g
 
     # ------------------------------------------------------------------
@@ -481,28 +495,30 @@ class OGPRViewerMainWindow(QMainWindow):
     def _build_menu(self):
         mb = self.menuBar()
         fm = mb.addMenu('&File')
-        a = QAction('&Open OGPR file(s)…', self)
+        a = QAction('&Open OGPR file(s)\u2026', self)
         a.setShortcut(QKeySequence.StandardKey.Open)
         a.triggered.connect(self.open_files)
         fm.addAction(a)
         fm.addSeparator()
-        a2 = QAction('&Export view…', self); a2.setShortcut('Ctrl+E')
+        a2 = QAction('&Export view\u2026', self); a2.setShortcut('Ctrl+E')
         a2.triggered.connect(self._export); fm.addAction(a2)
+        a3 = QAction('Export &debug stats\u2026', self); a3.setShortcut('Ctrl+D')
+        a3.triggered.connect(self._export_debug); fm.addAction(a3)
         fm.addSeparator()
-        a3 = QAction('E&xit', self)
-        a3.setShortcut(QKeySequence.StandardKey.Quit)
-        a3.triggered.connect(self.close); fm.addAction(a3)
+        a4 = QAction('E&xit', self)
+        a4.setShortcut(QKeySequence.StandardKey.Quit)
+        a4.triggered.connect(self.close); fm.addAction(a4)
 
         hm = mb.addMenu('&Help')
         ab = QAction('&About', self); ab.triggered.connect(self._about)
         hm.addAction(ab)
-        la = QAction('Open log file…', self); la.triggered.connect(self._open_log)
+        la = QAction('Open log file\u2026', self); la.triggered.connect(self._open_log)
         hm.addAction(la)
 
     def _build_statusbar(self):
         self.status = QStatusBar()
         self.setStatusBar(self.status)
-        self.status.showMessage('Ready – open OGPR files to start.')
+        self.status.showMessage('Ready \u2013 open OGPR files to start.')
 
     # ------------------------------------------------------------------
     # File loading
@@ -521,7 +537,7 @@ class OGPRViewerMainWindow(QMainWindow):
 
     def _load_async(self, filepath: str):
         size_mb = Path(filepath).stat().st_size / (1024 * 1024)
-        self.status.showMessage(f'Loading {Path(filepath).name}…')
+        self.status.showMessage(f'Loading {Path(filepath).name}\u2026')
         loader = FileLoaderThread(filepath, lazy=(size_mb > 150))
         loader.progress.connect(self.status.showMessage)
         loader.finished.connect(self._on_loaded)
@@ -539,9 +555,9 @@ class OGPRViewerMainWindow(QMainWindow):
 
         meta = data_dict['metadata']
         self.status.showMessage(
-            f"{Path(data_dict['filepath']).name}  ·  "
-            f"{meta['channels_count']} ch  ·  "
-            f"{meta['slices_count']} slices  ·  {meta['dtype_name']}",
+            f"{Path(data_dict['filepath']).name}  \u00b7  "
+            f"{meta['channels_count']} ch  \u00b7  "
+            f"{meta['slices_count']} slices  \u00b7  {meta['dtype_name']}",
             5000,
         )
         LOG.info(f"Swath added: {meta['swath_name']}")
@@ -565,39 +581,40 @@ class OGPRViewerMainWindow(QMainWindow):
     def _params(self) -> dict:
         v = self.velocity_spin.value()
         return {
-            't0':          self.cb_t0.isChecked(),
-            'tz_method':   self.tz_method.currentText(),
-            'tz_thresh':   self.tz_thresh.value(),
-            'dewow':       self.cb_dewow.isChecked(),
-            'dewow_win':   self.dewow_win.value(),
-            'bg':          self.cb_bg.isChecked(),
-            'bg_method':   self.bg_method.currentText(),
-            'bg_rolling':  self.cb_bg_rolling.isChecked(),
-            'bg_win_trc':  self.bg_win_traces.value(),
-            'bp':          self.cb_bp.isChecked(),
-            'bp_low':      self.bp_low.value(),
-            'bp_high':     self.bp_high.value(),
-            'bp_order':    self.bp_order.value(),
-            'notch':       self.cb_notch.isChecked(),
-            'notch_freq':  self.notch_freq.value(),
-            'notch_bw':    self.notch_bw.value(),
-            'sw':          self.cb_sw.isChecked(),
-            'sw_bp':       self.cb_sw_bp.isChecked(),
-            'gain':        self.cb_gain.isChecked(),
-            'gain_type':   self.gain_type.currentText(),
-            'gain_factor': self.gain_factor.value(),
-            'gain_alpha':  self.gain_alpha.value(),
-            'gain_tstart': self.gain_tstart.value(),
-            'gain_agcwin': self.gain_agc_win.value(),
-            'hilbert':     self.cb_hilbert.isChecked(),
-            'norm':        self.cb_norm.isChecked(),
-            'norm_method': self.norm_method.currentText(),
-            'mig':         self.cb_mig.isChecked(),
-            'mig_vel':     v,
-            'mig_ap':      self.mig_aperture.value(),
-            'cmap':        self.cmap_combo.currentText(),
-            'y_mode':      self._ymode(),
-            'velocity':    v,
+            't0':           self.cb_t0.isChecked(),
+            'tz_method':    self.tz_method.currentText(),
+            'tz_thresh':    self.tz_thresh.value(),
+            'dewow':        self.cb_dewow.isChecked(),
+            'dewow_win':    self.dewow_win.value(),
+            'bg':           self.cb_bg.isChecked(),
+            'bg_method':    self.bg_method.currentText(),
+            'bg_rolling':   self.cb_bg_rolling.isChecked(),
+            'bg_win_trc':   self.bg_win_traces.value(),
+            'bg_pertrace':  self.cb_bg_pertrace.isChecked(),
+            'bp':           self.cb_bp.isChecked(),
+            'bp_low':       self.bp_low.value(),
+            'bp_high':      self.bp_high.value(),
+            'bp_order':     self.bp_order.value(),
+            'notch':        self.cb_notch.isChecked(),
+            'notch_freq':   self.notch_freq.value(),
+            'notch_bw':     self.notch_bw.value(),
+            'sw':           self.cb_sw.isChecked(),
+            'sw_bp':        self.cb_sw_bp.isChecked(),
+            'gain':         self.cb_gain.isChecked(),
+            'gain_type':    self.gain_type.currentText(),
+            'gain_factor':  self.gain_factor.value(),
+            'gain_alpha':   self.gain_alpha.value(),
+            'gain_tstart':  self.gain_tstart.value(),
+            'gain_agcwin':  self.gain_agc_win.value(),
+            'hilbert':      self.cb_hilbert.isChecked(),
+            'norm':         self.cb_norm.isChecked(),
+            'norm_method':  self.norm_method.currentText(),
+            'mig':          self.cb_mig.isChecked(),
+            'mig_vel':      v,
+            'mig_ap':       self.mig_aperture.value(),
+            'cmap':         self.cmap_combo.currentText(),
+            'y_mode':       self._ymode(),
+            'velocity':     v,
         }
 
     # ------------------------------------------------------------------
@@ -625,6 +642,11 @@ class OGPRViewerMainWindow(QMainWindow):
                             rolling=p['bg_rolling'],
                             window_traces=p['bg_win_trc'],
                         )
+        # Per-trace equalization: applied after background removal and before gain
+        # so that each trace is amplitude-normalised before the gain ramps up.
+        if p.get('bg_pertrace', False):
+            proc.per_trace_normalize()
+
         if p['bp']:     proc.apply_bandpass(
                             low_freq=p['bp_low'],
                             high_freq=p['bp_high'],
@@ -671,8 +693,8 @@ class OGPRViewerMainWindow(QMainWindow):
                 data, time_axis, dx_m = self._process_swath(entry, p)
                 meta  = entry.data_dict['metadata']
                 title = (
-                    f"{meta['swath_name']} · "
-                    f"Ch {entry.channel} · "
+                    f"{meta['swath_name']} \u00b7 "
+                    f"Ch {entry.channel} \u00b7 "
                     f"{meta['dtype_name']}"
                 )
                 panels.append({
@@ -720,6 +742,7 @@ class OGPRViewerMainWindow(QMainWindow):
     def _reset_filters(self):
         for cb in [
             self.cb_t0, self.cb_dewow, self.cb_bg, self.cb_bg_rolling,
+            self.cb_bg_pertrace,
             self.cb_bp, self.cb_notch, self.cb_sw, self.cb_sw_bp,
             self.cb_gain, self.cb_hilbert, self.cb_norm, self.cb_mig,
         ]:
@@ -741,12 +764,65 @@ class OGPRViewerMainWindow(QMainWindow):
                 LOG.error(f'Export error: {e}\n{traceback.format_exc()}')
                 QMessageBox.critical(self, 'Export error', str(e))
 
+    def _export_debug(self):
+        """
+        Export per-trace statistics (rms, max_abs, mean, std) for every
+        visible swath after the full processing pipeline to a CSV file.
+
+        Use this to diagnose amplitude heterogeneity between traces:
+        if rms varies by >10x across a swath you almost certainly have
+        vertical-stripe artefacts that per-trace equalization will fix.
+        """
+        visible = [e for e in self._swath_entries if e.visible]
+        if not visible:
+            QMessageBox.information(self, 'Debug export', 'No swaths loaded.')
+            return
+
+        filename, _ = QFileDialog.getSaveFileName(
+            self, 'Export debug trace stats (CSV)', self.last_directory,
+            'CSV Files (*.csv);;All Files (*)'
+        )
+        if not filename:
+            return
+
+        try:
+            p = self._params()
+            with open(filename, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(['swath', 'trace_index', 'rms', 'max_abs', 'mean', 'std'])
+                for entry in visible:
+                    data, _, _ = self._process_swath(entry, p)
+                    sp   = SignalProcessor(
+                        data,
+                        sampling_time_ns=entry.data_dict['metadata']['sampling_time_ns'],
+                    )
+                    # get_trace_stats operates on whatever data is passed in;
+                    # we wrap in a fresh processor so we can call it cleanly.
+                    stats = sp.get_trace_stats()
+                    name  = entry.data_dict['metadata']['swath_name']
+                    n_trc = data.shape[1]
+                    for i in range(n_trc):
+                        writer.writerow([
+                            name, i,
+                            f'{stats["rms"][i]:.6g}',
+                            f'{stats["max"][i]:.6g}',
+                            f'{stats["mean"][i]:.6g}',
+                            f'{stats["std"][i]:.6g}',
+                        ])
+            self.status.showMessage(
+                f'Debug stats exported: {Path(filename).name}', 5000
+            )
+            LOG.info(f'Debug export: {filename}')
+        except Exception as e:
+            LOG.error(f'Debug export error: {e}\n{traceback.format_exc()}')
+            QMessageBox.critical(self, 'Export error', str(e))
+
     def _about(self):
         QMessageBox.about(
             self, 'About OGPR Radar Viewer',
             '<h3>OGPR Radar Viewer v2.3</h3>'
             '<p>Processing based on:<br>'
-            '<i>Goodman &amp; Piro (2013) – GPR Remote Sensing in Archaeology, Ch.3</i></p>'
+            '<i>Goodman &amp; Piro (2013) \u2013 GPR Remote Sensing in Archaeology, Ch.3</i></p>'
         )
 
     def _open_log(self):

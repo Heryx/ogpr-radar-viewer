@@ -8,6 +8,7 @@ Pipeline (in recommended order):
   1.  Time-Zero Correction        - align first breaks
   2.  Dewow                       - remove low-freq DC drift along each trace
   3.  Background Removal          - subtract mean/median trace (global or rolling)
+  3b. Per-Trace Equalization      - divide each trace by its RMS (remove stripes)
   4.  Bandpass Filter             - Butterworth band-pass in frequency domain
   5.  Notch Filter                - remove a single interference frequency
   6.  Spectral Whitening          - balance amplitudes across all frequencies
@@ -22,7 +23,7 @@ from __future__ import annotations
 
 import logging
 import traceback
-from typing import Literal, Optional, Tuple
+from typing import Dict, Literal, Optional, Tuple
 
 import numpy as np
 from scipy import signal as sp_signal
@@ -202,6 +203,34 @@ class SignalProcessor:
         return data
 
     # ------------------------------------------------------------------
+    # 3b. Per-Trace Equalization
+    # ------------------------------------------------------------------
+
+    def per_trace_normalize(self, eps: float = 1e-10) -> np.ndarray:
+        """
+        Equalize each trace independently by its RMS amplitude.
+
+        Removes amplitude differences between traces that cause vertical
+        stripes in the radargram.  Typical causes: varying antenna coupling,
+        heterogeneous soil moisture, or digitizer-level offsets between traces.
+
+        Should be called AFTER Background Removal and BEFORE Gain so that
+        the gain is applied to amplitude-equalised traces.
+
+        Args:
+            eps: Minimum RMS floor used to skip dead / zero-amplitude traces
+                 and prevent division-by-zero.
+        """
+        data = self.processed_data.copy()
+        for i in range(data.shape[1]):
+            rms = float(np.sqrt(np.mean(data[:, i] ** 2)))
+            if rms > eps:
+                data[:, i] = (data[:, i] / rms).astype(np.float32)
+        LOG.debug('Per-trace equalization applied')
+        self.processed_data = data
+        return data
+
+    # ------------------------------------------------------------------
     # 4. Bandpass Filter
     # ------------------------------------------------------------------
 
@@ -336,7 +365,7 @@ class SignalProcessor:
         self,
         gain_type:   Literal['exp', 'linear', 'sec', 'agc'] = 'sec',
         factor:      float = 2.0,
-        alpha:       float = 0.5,
+        alpha:       float = 0.05,
         t_start_ns:  float = 0.0,
         window_ns:   float = 50.0,
     ) -> np.ndarray:
@@ -350,13 +379,21 @@ class SignalProcessor:
         gain_type='linear'
             g(t) = 1 + factor * t/t_max
 
-        gain_type='sec'  ← recommended for GPR (Goodman & Piro 2013)
+        gain_type='sec'  <- recommended for GPR (Goodman & Piro 2013)
             SEC = Spreading & Exponential Compensation.
             Compensates for:
-              • Geometric spherical spreading  proportional to r² ∝ t²
-              • Exponential dielectric absorption  ∝ exp(alpha * t)
-            g(t) = t² * exp(alpha * t),  for t >= t_start_ns
-            This is the physically correct gain for ground wave attenuation.
+              * Geometric spherical spreading  proportional to r^2 ~ t^2
+              * Exponential dielectric absorption  ~ exp(alpha * t)
+            g(t) = t^2 * exp(alpha * t),  for t >= t_start_ns
+
+            Normalisation: g is divided by g(t_start + 1 sample) so that
+            the gain equals 1.0 at the first valid sample, then clipped at
+            factor * 200 (default factor=2 -> max 400x).  This prevents the
+            two failure modes of the old 1e4-normalisation:
+              (a) surface samples being multiplied by ~0 (image blanked)
+              (b) deep samples saturating when alpha is large (e.g. 0.5/ns
+                  gives g_max ~ 10^16 before capping)
+            Recommended alpha range: 0.01 – 0.10 ns^-1.
 
         gain_type='agc'
             Automatic Gain Control: normalise each sample by the RMS
@@ -364,8 +401,10 @@ class SignalProcessor:
             visual inspection when subsurface contrast is very low.
 
         Args:
-            factor:     Multiplier for exp/linear gain.
-            alpha:      Absorption coefficient [1/ns] for SEC.
+            factor:     For exp/linear: multiplier.  For SEC: max_gain = factor*200.
+            alpha:      Absorption coefficient [1/ns] for SEC gain.
+                        Typical GPR values: 0.01–0.10 ns^-1.
+                        Default changed from 0.5 to 0.05 to prevent saturation.
             t_start_ns: Delay before gain is applied [ns] (skip air wave).
             window_ns:  AGC window half-length [ns].
         """
@@ -385,16 +424,34 @@ class SignalProcessor:
             t_shifted = np.maximum(t - t_start_ns, 0.0)
             with np.errstate(over='ignore'):
                 g = (t_shifted ** 2) * np.exp(alpha * t_shifted)
-            # Normalise so that gain at t_max = 1e6 (avoid infinity)
-            g_max = float(g.max())
-            if g_max > 0:
-                g = g / g_max * 1e4
+
+            # --- Robust normalisation -------------------------------------------
+            # Normalise so that g equals 1.0 at the FIRST sample after t_start_ns
+            # (not at t_max as before).  This keeps the surface at unity gain and
+            # lets deep samples grow naturally, clipped to factor*200.
+            #
+            # Old code: g / g_max * 1e4  -> with alpha=0.5 and t=60 ns,
+            #   g_max ~ 3.8e16, range 0 -> 10000x, surface zeroed, depth saturated.
+            # -----------------------------------------------------------------------
+            start_idx = int(np.searchsorted(t, t_start_ns))
+            start_idx = min(start_idx + 1, n_smp - 1)
+            g_ref = float(g[start_idx])
+            if np.isfinite(g_ref) and g_ref > 0:
+                g = g / g_ref
+            else:
+                # Fallback for edge cases (e.g. t_start_ns at end of trace)
+                finite_vals = g[np.isfinite(g)]
+                finite_max  = float(finite_vals.max()) if len(finite_vals) else 1.0
+                g = np.where(np.isfinite(g), g / max(finite_max, 1.0) * 1e2, 1e2)
+
+            max_gain = max(1.0, factor * 200.0)   # default factor=2 -> 400x
+            g = np.clip(g, 0.0, max_gain)
+            # -----------------------------------------------------------------------
             g[t < t_start_ns] = 1.0
 
         elif gain_type == 'agc':
             win_smp = max(3, int(window_ns / self.sampling_time_ns))
             out     = data.copy()
-            # Vectorised RMS via uniform_filter1d for speed
             from scipy.ndimage import uniform_filter1d
             for i in range(data.shape[1]):
                 rms = np.sqrt(
@@ -518,8 +575,8 @@ class SignalProcessor:
 
         for j0 in range(n_trc):
             for i0 in range(n_smp):
-                t0      = i0 * dt          # apex two-way time [ns]
-                x0      = j0 * dx          # apex position [m]
+                t0      = i0 * dt
+                x0      = j0 * dx
                 acc     = 0.0
                 n_used  = 0
 
@@ -528,9 +585,9 @@ class SignalProcessor:
 
                 for j in range(j_lo, j_hi):
                     x      = j * dx
-                    offset = 2.0 * (x - x0) / v  # [ns]
-                    t      = np.sqrt(t0 ** 2 + offset ** 2)
-                    i_frac = t / dt
+                    offset = 2.0 * (x - x0) / v
+                    t_hyp  = np.sqrt(t0 ** 2 + offset ** 2)
+                    i_frac = t_hyp / dt
                     i_lo   = int(i_frac)
                     i_hi   = i_lo + 1
                     if i_hi >= n_smp:
@@ -563,7 +620,36 @@ class SignalProcessor:
         data  = self.processed_data
         n_smp = data.shape[0]
         specs = np.abs(np.fft.rfft(data, axis=0)) ** 2
-        mean_power = specs.mean(axis=1)  # average over traces
+        mean_power = specs.mean(axis=1)
         mean_power_db = 10.0 * np.log10(mean_power + 1e-30)
         freqs_mhz = np.fft.rfftfreq(n_smp, d=self.sampling_time_ns) * 1000.0
         return freqs_mhz.astype(np.float32), mean_power_db.astype(np.float32)
+
+    # ------------------------------------------------------------------
+    # Debug: per-trace statistics
+    # ------------------------------------------------------------------
+
+    def get_trace_stats(self) -> Dict[str, np.ndarray]:
+        """
+        Return per-trace statistics of the current processed data.
+
+        Useful for diagnosing amplitude heterogeneity between traces
+        (vertical-stripe artefacts) and for tuning per_trace_normalize.
+
+        Returns dict with keys:
+            'rms'  : ndarray(n_traces) – RMS amplitude per trace
+            'max'  : ndarray(n_traces) – max absolute amplitude per trace
+            'mean' : ndarray(n_traces) – mean amplitude per trace
+            'std'  : ndarray(n_traces) – std deviation per trace
+        """
+        data = self.processed_data
+        rms  = np.sqrt(np.mean(data ** 2, axis=0))
+        mx   = np.max(np.abs(data), axis=0)
+        mn   = np.mean(data, axis=0)
+        sd   = np.std(data, axis=0)
+        return {
+            'rms':  rms.astype(np.float32),
+            'max':  mx.astype(np.float32),
+            'mean': mn.astype(np.float32),
+            'std':  sd.astype(np.float32),
+        }
