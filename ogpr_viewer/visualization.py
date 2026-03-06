@@ -2,24 +2,33 @@
 Visualization utilities for GPR data.
 
 MultiPanelCanvas:
-  - Auto-grid layout (1x1, 1x2, 2x2, ...)
-  - X axis: distance in metres  (trace_spacing_m * n_traces)
-  - Y axis: switchable  time (ns) | relative depth (m) | absolute depth (m)
+  - Syncs matplotlib Figure size to the actual Qt widget pixel size
+    (avoids blank canvas on first render)
+  - Auto-grid layout for 1..N panels
+  - X axis: distance in metres (trace_spacing_m * n_traces)
+  - Y axis: switchable  time (ns) | depth_rel (m) | depth_abs (m)
   - Dark theme
 """
 
 from __future__ import annotations
 
-import math
 import logging
+import math
 import traceback
 from typing import Dict, List, Literal, Optional, Tuple
 
 import numpy as np
+
 import matplotlib
 matplotlib.use('QtAgg')
+
+# Suppress the massive findfont DEBUG flood
+logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING)
+
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+
+from PyQt6.QtCore  import QTimer
 from PyQt6.QtWidgets import QSizePolicy
 
 LOG = logging.getLogger('ogpr_viewer')
@@ -35,53 +44,92 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
     """
     Renders 1..N GPR B-scans in an auto-computed grid.
 
-    Each panel dict expected in render_panels():
-      data            : np.ndarray  shape (samples, traces)  float32
-      time_axis       : np.ndarray  [ns]  length = samples
-      title           : str
-      trace_spacing_m : float  horizontal spacing between traces [m]
-                        If absent, X axis shows trace indices.
-
-    Shared display parameters (passed to render_panels):
-      cmap            : matplotlib colormap name
-      y_mode          : 'time' | 'depth_rel' | 'depth_abs'
-      velocity_m_ns   : EM velocity [m/ns]  used when y_mode != 'time'
+    Panel dict keys (passed to render_panels):
+        data            : np.ndarray  (samples, traces)  float32
+        time_axis       : np.ndarray  [ns],  length = samples
+        title           : str
+        trace_spacing_m : float  [m] per trace  (0 = unknown -> show Trace #)
     """
 
-    def __init__(self, parent=None, dpi=96):
-        # Do NOT set a fixed figsize here - let Qt determine the size
-        self.fig = Figure(facecolor='#1e1e1e', tight_layout=False)
+    # minimum pixel dimensions to avoid degenerate renders
+    _MIN_W = 320
+    _MIN_H = 220
+
+    def __init__(self, parent=None, dpi: int = 96):
+        self._dpi = dpi
+        self.fig = Figure(
+            figsize=(8, 5),   # sensible default; will be overridden on first render
+            dpi=dpi,
+            facecolor='#1e1e1e',
+        )
         super().__init__(self.fig)
         self.setParent(parent)
-
-        # Make the canvas expand to fill available space
         self.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding,
         )
+        self.setMinimumSize(self._MIN_W, self._MIN_H)
         self.updateGeometry()
+
+        # state for re-render on resize
+        self._last_panels:   List[Dict] = []
+        self._last_cmap:     str   = 'gray'
+        self._last_y_mode:   YMode = 'time'
+        self._last_vel:      float = 0.10
+        self._last_t0:       float = 0.0
 
         self._axes:   list = []
         self._images: list = []
         self._cbars:  list = []
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Qt event overrides
+    # ------------------------------------------------------------------
+
+    def resizeEvent(self, event):
+        """Re-render when the widget is resized so the figure fills the new size."""
+        super().resizeEvent(event)
+        if self._last_panels:
+            # deferred so Qt finishes the resize first
+            QTimer.singleShot(30, self._re_render)
+
+    # ------------------------------------------------------------------
+    # Helpers
     # ------------------------------------------------------------------
 
     @staticmethod
     def _grid(n: int) -> Tuple[int, int]:
-        """Auto-compute (rows, cols) for n panels."""
         if n <= 0:
             return 1, 1
         cols = math.ceil(math.sqrt(n))
         rows = math.ceil(n / cols)
         return rows, cols
 
-    @staticmethod
-    def _depth_axis(time_axis_ns: np.ndarray, velocity_m_ns: float) -> np.ndarray:
-        """Convert two-way travel time to depth [m]."""
-        return time_axis_ns * velocity_m_ns / 2.0
+    def _sync_fig_size(self):
+        """
+        Set the matplotlib Figure size to the current Qt widget pixel size.
+        forward=False prevents a Qt resize loop.
+        """
+        w_px = max(self.width(),  self._MIN_W)
+        h_px = max(self.height(), self._MIN_H)
+        self.fig.set_size_inches(
+            w_px / self._dpi,
+            h_px / self._dpi,
+            forward=False,
+        )
+        LOG.debug(f'Canvas sync: {w_px}x{h_px}px  '
+                  f'{w_px/self._dpi:.1f}x{h_px/self._dpi:.1f}in')
+
+    def _re_render(self):
+        """Re-render with the stored last parameters (called after resize)."""
+        if self._last_panels:
+            self._render(
+                self._last_panels,
+                self._last_cmap,
+                self._last_y_mode,
+                self._last_vel,
+                self._last_t0,
+            )
 
     # ------------------------------------------------------------------
     # Public API
@@ -89,29 +137,42 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
 
     def render_panels(
         self,
-        panels:         List[Dict],
-        cmap:           str    = 'gray',
-        y_mode:         YMode  = 'time',
-        velocity_m_ns:  float  = 0.10,
-        t0_ns:          float  = 0.0,
+        panels:        List[Dict],
+        cmap:          str   = 'gray',
+        y_mode:        YMode = 'time',
+        velocity_m_ns: float = 0.10,
+        t0_ns:         float = 0.0,
     ):
         """
-        Render all panels.
+        Render panels and cache parameters for re-render on resize.
 
-        Args:
-            panels:        list of panel dicts (see class docstring)
-            cmap:          matplotlib colormap
-            y_mode:        'time'       -> Y axis in nanoseconds
-                           'depth_rel'  -> Y axis in metres from surface
-                                          (depth = (t - t0) * v / 2)
-                           'depth_abs'  -> same as depth_rel (t0 always subtracted)
-            velocity_m_ns: EM velocity [m/ns] for depth conversion
-            t0_ns:         Time-zero offset [ns] subtracted before depth calc
+        y_mode options:
+          'time'      → Y axis in ns
+          'depth_rel' → Y axis depth from surface [m]  d = t*v/2
+          'depth_abs' → Y axis depth with t0 removed   d = (t-t0)*v/2
         """
+        self._last_panels = panels
+        self._last_cmap   = cmap
+        self._last_y_mode = y_mode
+        self._last_vel    = velocity_m_ns
+        self._last_t0     = t0_ns
+        self._render(panels, cmap, y_mode, velocity_m_ns, t0_ns)
+
+    def _render(
+        self,
+        panels:        List[Dict],
+        cmap:          str,
+        y_mode:        YMode,
+        velocity_m_ns: float,
+        t0_ns:         float,
+    ):
         LOG.debug(
-            f'render_panels n={len(panels)} cmap={cmap} '
+            f'_render: n={len(panels)} cmap={cmap} '
             f'y_mode={y_mode} v={velocity_m_ns} m/ns'
         )
+
+        # --- sync figure size to widget BEFORE clearing ---
+        self._sync_fig_size()
 
         # --- tear down previous render ---
         for cb in self._cbars:
@@ -123,68 +184,71 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
         self.fig.clf()
 
         if not panels:
-            self.draw()
+            self.draw_idle()
             return
 
         rows, cols = self._grid(len(panels))
 
-        # Use gridspec for tight control over spacing
-        gs = self.fig.add_gridspec(
-            rows, cols,
-            left=0.07, right=0.97,
-            top=0.94,  bottom=0.08,
-            hspace=0.38, wspace=0.35,
+        # constrained_layout handles spacing automatically
+        self.fig.set_constrained_layout(True)
+        self.fig.set_constrained_layout_pads(
+            w_pad=0.04, h_pad=0.06,
+            wspace=0.04, hspace=0.06,
         )
 
         for idx, panel in enumerate(panels):
-            row = idx // cols
-            col = idx  % cols
-            ax  = self.fig.add_subplot(gs[row, col])
+            ax = self.fig.add_subplot(rows, cols, idx + 1)
             ax.set_facecolor('#111111')
             self._axes.append(ax)
 
-            data      = np.asarray(panel['data'],  dtype=np.float32)
-            t_axis    = np.asarray(panel.get('time_axis', np.arange(data.shape[0])),
-                                   dtype=np.float32)
-            title     = panel.get('title', f'Panel {idx+1}')
-            dx        = float(panel.get('trace_spacing_m', 0.0))  # 0 = unknown
-            n_trc     = data.shape[1]
+            data     = np.asarray(panel['data'],   dtype=np.float32)
+            t_axis   = np.asarray(
+                panel.get('time_axis', np.arange(data.shape[0], dtype=np.float32)),
+                dtype=np.float32,
+            )
+            title    = panel.get('title', f'Panel {idx+1}')
+            dx       = float(panel.get('trace_spacing_m', 0.0))
+            n_smp, n_trc = data.shape
 
-            # ---------- X axis ----------
+            # --- X axis ---
             if dx > 0:
-                x_min = 0.0
-                x_max = dx * (n_trc - 1)
-                x_label = 'Distance (m)'
+                x_min, x_max = 0.0, dx * (n_trc - 1)
+                x_label = f'Distance  ({x_max:.2f} m)'
             else:
-                x_min = 0
-                x_max = n_trc - 1
-                x_label = 'Trace #'
+                x_min, x_max = 0, n_trc - 1
+                x_label = f'Trace  (0 – {n_trc-1})'
 
-            # ---------- Y axis ----------
+            # --- Y axis ---
             if y_mode == 'time':
                 y_top    = float(t_axis[0])
                 y_bottom = float(t_axis[-1])
-                y_label  = 'Time (ns)'
+                y_label  = f'Time  (0 – {y_bottom:.1f} ns)'
             else:
-                # depth = (t - t0) * v / 2
                 d_axis   = np.maximum(t_axis - t0_ns, 0.0) * velocity_m_ns / 2.0
                 y_top    = float(d_axis[0])
                 y_bottom = float(d_axis[-1])
-                y_label  = 'Depth (m)'
+                y_label  = f'Depth  (0 – {y_bottom:.2f} m)'
 
+            # extent for imshow: [left, right, bottom, top]
+            # origin='upper' → row-0 at top → y_top is the top of the image
             extent = [x_min, x_max, y_bottom, y_top]
 
             try:
-                # Robust colour limits (2nd / 98th percentile)
                 vmin = float(np.percentile(data, 2))
                 vmax = float(np.percentile(data, 98))
-                if vmin == vmax:          # flat data guard
+                if vmax <= vmin:
                     vmax = vmin + 1.0
+
+                LOG.debug(
+                    f'Panel {idx}: shape={data.shape}  '
+                    f'extent={[round(v,3) for v in extent]}  '
+                    f'vmin={vmin:.3g}  vmax={vmax:.3g}'
+                )
 
                 im = ax.imshow(
                     data,
                     cmap=cmap,
-                    aspect='auto',        # fill the axes rectangle
+                    aspect='auto',
                     extent=extent,
                     vmin=vmin,
                     vmax=vmax,
@@ -193,46 +257,37 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
                 )
                 self._images.append(im)
 
-                # Axes decoration
-                ax.set_xlabel(x_label, fontsize=8,  color='#cccccc', labelpad=2)
-                ax.set_ylabel(y_label, fontsize=8,  color='#cccccc', labelpad=2)
-                ax.set_title(title,    fontsize=8,  color='#ffffff',
-                             fontweight='bold', pad=4)
-                ax.tick_params(colors='#aaaaaa', labelsize=7, length=3)
+                ax.set_xlabel(x_label, fontsize=8,  color='#bbbbbb', labelpad=2)
+                ax.set_ylabel(y_label, fontsize=8,  color='#bbbbbb', labelpad=2)
+                ax.set_title( title,   fontsize=8,  color='#ffffff',
+                              fontweight='bold', pad=3)
+                ax.tick_params(colors='#888888', labelsize=7, length=3, width=0.6)
                 for sp in ax.spines.values():
-                    sp.set_edgecolor('#555555')
+                    sp.set_edgecolor('#444444')
+                    sp.set_linewidth(0.6)
 
-                # Colorbar
-                cb = self.fig.colorbar(
-                    im, ax=ax, fraction=0.030, pad=0.02
-                )
-                cb.ax.tick_params(labelsize=6, colors='#888888')
-                cb.set_label('Amplitude', color='#888888', fontsize=6)
+                cb = self.fig.colorbar(im, ax=ax, fraction=0.028, pad=0.02)
+                cb.ax.tick_params(labelsize=6, colors='#777777')
+                cb.set_label('Amplitude', color='#777777', fontsize=6)
                 self._cbars.append(cb)
 
-                LOG.debug(
-                    f'Panel {idx}: shape={data.shape} '
-                    f'x=[{x_min:.2f},{x_max:.2f}] '
-                    f'y=[{y_top:.3f},{y_bottom:.3f}] '
-                    f'vmin={vmin:.2f} vmax={vmax:.2f}'
-                )
-
             except Exception as e:
-                LOG.error(
-                    f'Panel {idx} render error: {e}\n{traceback.format_exc()}'
-                )
+                LOG.error(f'Panel {idx} render error: {e}\n{traceback.format_exc()}')
                 ax.text(
                     0.5, 0.5, f'Render error:\n{e}',
                     ha='center', va='center',
                     color='red', fontsize=8,
                     transform=ax.transAxes,
+                    wrap=True,
                 )
 
-        self.draw()
+        # Use draw_idle (deferred) so Qt has finished its own layout pass
+        self.draw_idle()
 
     # ------------------------------------------------------------------
 
     def clear(self):
+        self._last_panels = []
         for cb in self._cbars:
             try: cb.remove()
             except Exception: pass
@@ -240,9 +295,11 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
         self._axes   = []
         self._images = []
         self.fig.clf()
-        self.draw()
+        self.draw_idle()
 
     def save_figure(self, filepath: str, dpi: int = 200):
+        # Sync to widget size before saving
+        self._sync_fig_size()
         self.fig.savefig(
             filepath, dpi=dpi,
             bbox_inches='tight',
@@ -283,9 +340,8 @@ class RadarCanvas(FigureCanvasQTAgg):
 
         if time_axis  is None: time_axis  = np.arange(data.shape[0])
         if trace_axis is None: trace_axis = np.arange(data.shape[1])
-        if vmin is None or vmax is None:
-            vmin = float(np.percentile(data, 2))
-            vmax = float(np.percentile(data, 98))
+        if vmin is None: vmin = float(np.percentile(data, 2))
+        if vmax is None: vmax = float(np.percentile(data, 98))
 
         extent = [
             float(trace_axis[0]),  float(trace_axis[-1]),
@@ -300,14 +356,7 @@ class RadarCanvas(FigureCanvasQTAgg):
         self.axes.set_title(title, fontsize=11, fontweight='bold')
         self.colorbar = self.fig.colorbar(self.image, ax=self.axes, label='Amplitude')
         self.fig.tight_layout()
-        self.draw()
-
-    def update_colormap(self, cmap: str):
-        if self.image is not None:
-            self.image.set_cmap(cmap)
-            if self.colorbar is not None:
-                self.colorbar.update_normal(self.image)
-            self.draw()
+        self.draw_idle()
 
     def save_figure(self, filepath: str, dpi: int = 200):
         self.fig.savefig(filepath, dpi=dpi, bbox_inches='tight')
