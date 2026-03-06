@@ -4,6 +4,12 @@ OGPR File Parser
 Handles reading and parsing of .ogpr format GPR data files.
 Supports OGPR format versions 1.x and 2.x.
 Supports IDS Stream UP (float32) and IDS Stream DP (int16) antenna types.
+
+Header format (fields separated by newlines):
+  Line 0: "ogpr"
+  Line 1: UUID  (32 hex chars)
+  Line 2: data offset  (8 hex chars)
+  Remaining bytes up to data_offset: JSON descriptor
 """
 
 import json
@@ -22,7 +28,6 @@ class OGPRParser:
       - absent (v1)           => np.float32  (default)
     """
 
-    # dtype map from 'valueType' field in JSON
     _DTYPE_MAP = {
         'float': np.float32,
         'int':   np.int16,
@@ -46,19 +51,58 @@ class OGPRParser:
     # Header / JSON
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _read_line(f) -> str:
+        """Read one newline-terminated text line from a binary file handle."""
+        buf = b''
+        while True:
+            ch = f.read(1)
+            if ch in (b'\n', b''):
+                break
+            buf += ch
+        return buf.decode('ascii').strip()
+
     def parse_header(self) -> Dict:
-        """Parse OGPR file header and JSON descriptor."""
+        """
+        Parse OGPR file header and JSON descriptor.
+
+        The header consists of three newline-separated text lines:
+          1. signature  -> must be 'ogpr'
+          2. UUID       -> 32 hex characters
+          3. data offset -> 8 hex characters (big-endian uint32 as hex string)
+
+        Everything from after those three lines up to byte <data_offset>
+        is the UTF-8 JSON descriptor.
+        """
         with open(self.filepath, 'rb') as f:
-            signature = f.read(4).decode('ascii')
+            # --- line 1: signature ---
+            signature = self._read_line(f)
             if signature != 'ogpr':
-                raise ValueError(f"Invalid OGPR signature: '{signature}'")
+                raise ValueError(
+                    f"Invalid OGPR signature: '{signature}' "
+                    f"(expected 'ogpr')"
+                )
 
-            uuid = f.read(32).decode('ascii')  # noqa: F841
+            # --- line 2: UUID ---
+            uuid = self._read_line(f)  # noqa: F841  (stored for future use)
 
-            offset_hex = f.read(8).decode('ascii')
-            data_offset = int(offset_hex, 16)
+            # --- line 3: data offset (hex) ---
+            offset_hex = self._read_line(f).strip()
+            try:
+                data_offset = int(offset_hex, 16)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Cannot parse data offset '{offset_hex}' as hex: {exc}"
+                ) from exc
 
-            json_size = data_offset - f.tell()
+            # --- JSON descriptor ---
+            current_pos = f.tell()
+            json_size   = data_offset - current_pos
+            if json_size <= 0:
+                raise ValueError(
+                    f"data_offset ({data_offset}) <= current position "
+                    f"({current_pos}); file may be corrupted."
+                )
             json_raw = f.read(json_size).decode('utf-8').strip()
 
         self.descriptor = json.loads(json_raw)
@@ -69,13 +113,6 @@ class OGPRParser:
     # ------------------------------------------------------------------
 
     def _detect_dtype(self) -> type:
-        """
-        Detect numpy dtype for the Radar Volume block.
-
-        Priority:
-          1. 'valueType' field inside the Radar Volume block descriptor
-          2. Default: float32
-        """
         for block in self.descriptor['dataBlockDescriptors']:
             if block['type'] == 'Radar Volume':
                 vtype = block.get('valueType', 'float').lower()
@@ -87,7 +124,6 @@ class OGPRParser:
     # ------------------------------------------------------------------
 
     def get_metadata(self) -> Dict:
-        """Return a flat metadata dict with the most useful fields."""
         if self.descriptor is None:
             self.parse_header()
 
@@ -96,22 +132,22 @@ class OGPRParser:
             b for b in self.descriptor['dataBlockDescriptors']
             if b['type'] == 'Radar Volume'
         )
-        r = radar_block['radar']
+        r     = radar_block['radar']
         dtype = self._detect_dtype()
 
         return {
-            'samples_count':   main['samplesCount'],
-            'channels_count':  main['channelsCount'],
-            'slices_count':    main['slicesCount'],
-            'sampling_step_m': r['samplingStep_m'],
+            'samples_count':    main['samplesCount'],
+            'channels_count':   main['channelsCount'],
+            'slices_count':     main['slicesCount'],
+            'sampling_step_m':  r['samplingStep_m'],
             'sampling_time_ns': r['samplingTime_ns'],
-            'frequency_mhz':   r.get('fequency_MHz', r.get('frequency_MHz', 0)),
-            'polarization':    r['polarization'],
-            'swath_name':      main.get('metadata', {}).get('swathName', 'Unknown'),
-            'array_id':        main.get('metadata', {}).get('arrayId', 0),
-            'version':         self.descriptor.get('version', {'major': 1, 'minor': 0}),
-            'dtype':           dtype,
-            'dtype_name':      'float32' if dtype == np.float32 else 'int16',
+            'frequency_mhz':    r.get('fequency_MHz', r.get('frequency_MHz', 0)),
+            'polarization':     r['polarization'],
+            'swath_name':       main.get('metadata', {}).get('swathName', 'Unknown'),
+            'array_id':         main.get('metadata', {}).get('arrayId', 0),
+            'version':          self.descriptor.get('version', {'major': 1, 'minor': 0}),
+            'dtype':            dtype,
+            'dtype_name':       'float32' if dtype == np.float32 else 'int16',
         }
 
     # ------------------------------------------------------------------
@@ -119,15 +155,6 @@ class OGPRParser:
     # ------------------------------------------------------------------
 
     def load_radar_volume(self, lazy: bool = False) -> np.ndarray:
-        """
-        Load the Radar Volume binary block.
-
-        Args:
-            lazy: If True, return a memory-mapped array (useful for large files).
-
-        Returns:
-            3-D ndarray  shape=(samples, channels, slices), dtype=float32 or int16.
-        """
         if self.descriptor is None:
             self.parse_header()
 
@@ -149,8 +176,7 @@ class OGPRParser:
         if byte_size != expected:
             print(
                 f"[OGPR] Warning: expected {expected} bytes for "
-                f"{dtype.__name__} radar volume, got {byte_size}. "
-                f"Will attempt reshape anyway."
+                f"{dtype.__name__} volume, got {byte_size}."
             )
 
         shape = (samples, channels, slices)
@@ -166,7 +192,7 @@ class OGPRParser:
                 raw = f.read(byte_size)
             data = np.frombuffer(raw, dtype=dtype).reshape(shape)
 
-        # Always work in float32 internally for processing
+        # Always process as float32
         if dtype == np.int16:
             data = data.astype(np.float32)
 
@@ -178,7 +204,6 @@ class OGPRParser:
     # ------------------------------------------------------------------
 
     def load_geolocations(self) -> Optional[np.ndarray]:
-        """Load sample geographic locations (float64, XYZ in EPSG units)."""
         if self.descriptor is None:
             self.parse_header()
 
@@ -209,10 +234,7 @@ class OGPRParser:
             (slices, samples, 3),
             (slices, 3),
         ]:
-            expected_n = 1
-            for d in shape:
-                expected_n *= d
-            if data.size == expected_n:
+            if data.size == int(np.prod(shape)):
                 self.geolocations = data.reshape(shape)
                 return self.geolocations
 
@@ -225,10 +247,9 @@ class OGPRParser:
     # ------------------------------------------------------------------
 
     def load_data(self, lazy: bool = False) -> Dict:
-        """Load all data (radar volume + geolocations + metadata)."""
-        metadata      = self.get_metadata()
-        radar_volume  = self.load_radar_volume(lazy=lazy)
-        geolocations  = self.load_geolocations()
+        metadata     = self.get_metadata()
+        radar_volume = self.load_radar_volume(lazy=lazy)
+        geolocations = self.load_geolocations()
 
         return {
             'radar_volume': radar_volume,
@@ -240,7 +261,6 @@ class OGPRParser:
 
     def get_bscan(self, channel: int = 0, slice_start: int = 0,
                   slice_end: Optional[int] = None) -> np.ndarray:
-        """Extract a 2-D B-scan (samples × slices) for the given channel."""
         if self.radar_data is None:
             self.load_radar_volume()
         s = slice_end if slice_end is not None else self.radar_data.shape[2]
