@@ -19,6 +19,10 @@ Velocity is a single global parameter shared between:
 import sys
 import logging
 import traceback
+import json
+import zipfile
+import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing  import List
 
@@ -389,7 +393,7 @@ class OGPRViewerMainWindow(QMainWindow):
             '<small><i>SEC = Spreading &amp; Exponential Compensation</i></small>'
         ))
         self._dspin(v, '  Factor (exp/lin):',    'gain_factor', 0.1, 20.0, 2.0, 0.1)
-        self._dspin(v, '  α (SEC) [1/ns]:',      'gain_alpha',  0.0,  5.0, 0.5, 0.05)
+        self._dspin(v, '  \u03b1 (SEC) [1/ns]:',      'gain_alpha',  0.0,  5.0, 0.5, 0.05)
         self._dspin(v, '  t-start (SEC) [ns]:', 'gain_tstart', 0.0, 100.0, 0.0, 0.5, ' ns')
         self._dspin(v, '  AGC window:',          'gain_agc_win',1.0, 500.0, 50.0, 5.0, ' ns')
         g.setLayout(v); return g
@@ -405,7 +409,7 @@ class OGPRViewerMainWindow(QMainWindow):
         g = QGroupBox('Kirchhoff Migration'); v = QVBoxLayout()
         self._cb(v, 'Enable', 'cb_mig')
         v.addWidget(QLabel(
-            '<small><i>Uses the velocity set in Display ↓</i></small>'
+            '<small><i>Uses the velocity set in Display \u2193</i></small>'
         ))
         self._ispin(v, '  Aperture:', 'mig_aperture', 5, 200, 30, ' trc')
         g.setLayout(v); return g
@@ -428,8 +432,8 @@ class OGPRViewerMainWindow(QMainWindow):
         self.ymode_grp = QButtonGroup(self)
         for label, mode in [
             ('Time (ns)',           'time'),
-            ('Depth – relative (m)', 'depth_rel'),
-            ('Depth – absolute (m)', 'depth_abs'),
+            ('Depth \u2013 relative (m)', 'depth_rel'),
+            ('Depth \u2013 absolute (m)', 'depth_abs'),
         ]:
             rb = QRadioButton(label)
             rb.setProperty('ymode', mode)
@@ -445,8 +449,8 @@ class OGPRViewerMainWindow(QMainWindow):
         # --- Velocity  (shared by depth conversion + migration) ---
         v.addWidget(QLabel('EM Velocity  [m/ns]:'))
         v.addWidget(QLabel(
-            '<small>dry sand 0.12–0.15 · moist soil 0.08–0.10<br>'
-            'wet clay 0.05–0.07 · concrete 0.10–0.12</small>'
+            '<small>dry sand 0.12\u20130.15 \u00b7 moist soil 0.08\u20130.10<br>'
+            'wet clay 0.05\u20130.07 \u00b7 concrete 0.10\u20130.12</small>'
         ))
         row = QHBoxLayout()
         self.velocity_spin = QDoubleSpinBox()
@@ -469,10 +473,146 @@ class OGPRViewerMainWindow(QMainWindow):
 
     def _grp_export(self):
         g = QGroupBox('Export'); v = QVBoxLayout()
-        btn = QPushButton('Export current view…')
+
+        btn = QPushButton('Export current view\u2026')
         btn.clicked.connect(self._export)
         v.addWidget(btn)
+
+        dbg = QPushButton('Export debug bundle (.zip)\u2026')
+        dbg.clicked.connect(self._export_debug_bundle)
+        v.addWidget(dbg)
+
         g.setLayout(v); return g
+
+    def _export_debug_bundle(self):
+        visible = [e for e in self._swath_entries if e.visible]
+        if not visible:
+            QMessageBox.information(self, 'Debug export', 'No swaths visible.')
+            return
+
+        p = self._params()
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        default_name = str(Path(self.last_directory) / f'ogpr_debug_{ts}.zip')
+
+        zip_path, _ = QFileDialog.getSaveFileName(
+            self, 'Export debug bundle', default_name, 'ZIP (*.zip);;All Files (*)'
+        )
+        if not zip_path:
+            return
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp = Path(tmp)
+
+                manifest = {
+                    "created": ts,
+                    "params": p,
+                    "swaths": [],
+                }
+
+                for entry in visible:
+                    meta = entry.data_dict["metadata"]
+                    swath_name = meta.get("swath_name", "swath")
+                    ch = entry.channel
+
+                    rv = entry.data_dict["radar_volume"]
+                    raw = np.asarray(rv[:, ch, :], dtype=np.float32)
+
+                    processed, time_axis, dx_m = self._process_swath(entry, p)
+
+                    base = f"{swath_name}_ch{ch}"
+                    npz_path = tmp / f"{base}.npz"
+                    np.savez_compressed(
+                        npz_path,
+                        raw=raw,
+                        processed=np.asarray(processed, dtype=np.float32),
+                        time_ns=np.asarray(time_axis, dtype=np.float32),
+                        trace_spacing_m=float(dx_m),
+                        sampling_time_ns=float(meta.get("sampling_time_ns", np.nan)),
+                    )
+
+                    json_path = tmp / f"{base}_meta.json"
+                    json_path.write_text(
+                        json.dumps(
+                            {
+                                "filepath": entry.data_dict.get("filepath", ""),
+                                "swath_name": swath_name,
+                                "channel": ch,
+                                "metadata": meta,
+                                "params": p,
+                            },
+                            ensure_ascii=False,
+                            indent=2,
+                        ),
+                        encoding="utf-8",
+                    )
+
+                    manifest["swaths"].append(
+                        {
+                            "swath": swath_name,
+                            "channel": ch,
+                            "npz": npz_path.name,
+                            "meta": json_path.name,
+                            "shape_raw": list(raw.shape),
+                            "shape_processed": list(np.asarray(processed).shape),
+                        }
+                    )
+
+                    # Quicklook PNG (raw vs processed)
+                    try:
+                        from matplotlib.figure import Figure
+
+                        fig = Figure(figsize=(10, 4), dpi=150)
+                        ax1 = fig.add_subplot(1, 2, 1)
+                        ax2 = fig.add_subplot(1, 2, 2)
+
+                        def _lims(a):
+                            vmin = float(np.percentile(a, 2))
+                            vmax = float(np.percentile(a, 98))
+                            if vmax <= vmin:
+                                vmax = vmin + 1.0
+                            return vmin, vmax
+
+                        vmin_r, vmax_r = _lims(raw)
+                        vmin_p, vmax_p = _lims(processed)
+
+                        ax1.imshow(raw, aspect="auto", cmap="gray", vmin=vmin_r, vmax=vmax_r)
+                        ax1.set_title("RAW")
+                        ax1.set_xlabel("Trace")
+                        ax1.set_ylabel("Sample")
+
+                        ax2.imshow(processed, aspect="auto", cmap="gray", vmin=vmin_p, vmax=vmax_p)
+                        ax2.set_title("PROCESSED")
+                        ax2.set_xlabel("Trace")
+                        ax2.set_ylabel("Sample")
+
+                        fig.tight_layout()
+                        fig.savefig(tmp / f"{base}_quicklook.png")
+                    except Exception:
+                        pass
+
+                (tmp / "manifest.json").write_text(
+                    json.dumps(manifest, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+
+                log_path = Path(sys.argv[0]).parent / "ogpr_viewer_debug.log"
+                if log_path.exists():
+                    try:
+                        (tmp / "ogpr_viewer_debug.log").write_bytes(log_path.read_bytes())
+                    except Exception:
+                        pass
+
+                with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+                    for f in tmp.rglob("*"):
+                        if f.is_file():
+                            z.write(f, arcname=f.name)
+
+            self.status.showMessage(f"Debug bundle exported: {Path(zip_path).name}", 6000)
+
+        except Exception as e:
+            LOG.error(f"Debug export error: {e}\n{traceback.format_exc()}")
+            QMessageBox.critical(self, "Debug export error", str(e))
 
     # ------------------------------------------------------------------
     # Menu / Status
@@ -481,12 +621,12 @@ class OGPRViewerMainWindow(QMainWindow):
     def _build_menu(self):
         mb = self.menuBar()
         fm = mb.addMenu('&File')
-        a = QAction('&Open OGPR file(s)…', self)
+        a = QAction('&Open OGPR file(s)\u2026', self)
         a.setShortcut(QKeySequence.StandardKey.Open)
         a.triggered.connect(self.open_files)
         fm.addAction(a)
         fm.addSeparator()
-        a2 = QAction('&Export view…', self); a2.setShortcut('Ctrl+E')
+        a2 = QAction('&Export view\u2026', self); a2.setShortcut('Ctrl+E')
         a2.triggered.connect(self._export); fm.addAction(a2)
         fm.addSeparator()
         a3 = QAction('E&xit', self)
@@ -496,13 +636,13 @@ class OGPRViewerMainWindow(QMainWindow):
         hm = mb.addMenu('&Help')
         ab = QAction('&About', self); ab.triggered.connect(self._about)
         hm.addAction(ab)
-        la = QAction('Open log file…', self); la.triggered.connect(self._open_log)
+        la = QAction('Open log file\u2026', self); la.triggered.connect(self._open_log)
         hm.addAction(la)
 
     def _build_statusbar(self):
         self.status = QStatusBar()
         self.setStatusBar(self.status)
-        self.status.showMessage('Ready – open OGPR files to start.')
+        self.status.showMessage('Ready \u2013 open OGPR files to start.')
 
     # ------------------------------------------------------------------
     # File loading
@@ -521,7 +661,7 @@ class OGPRViewerMainWindow(QMainWindow):
 
     def _load_async(self, filepath: str):
         size_mb = Path(filepath).stat().st_size / (1024 * 1024)
-        self.status.showMessage(f'Loading {Path(filepath).name}…')
+        self.status.showMessage(f'Loading {Path(filepath).name}\u2026')
         loader = FileLoaderThread(filepath, lazy=(size_mb > 150))
         loader.progress.connect(self.status.showMessage)
         loader.finished.connect(self._on_loaded)
@@ -539,9 +679,9 @@ class OGPRViewerMainWindow(QMainWindow):
 
         meta = data_dict['metadata']
         self.status.showMessage(
-            f"{Path(data_dict['filepath']).name}  ·  "
-            f"{meta['channels_count']} ch  ·  "
-            f"{meta['slices_count']} slices  ·  {meta['dtype_name']}",
+            f"{Path(data_dict['filepath']).name}  \u00b7  "
+            f"{meta['channels_count']} ch  \u00b7  "
+            f"{meta['slices_count']} slices  \u00b7  {meta['dtype_name']}",
             5000,
         )
         LOG.info(f"Swath added: {meta['swath_name']}")
@@ -671,8 +811,8 @@ class OGPRViewerMainWindow(QMainWindow):
                 data, time_axis, dx_m = self._process_swath(entry, p)
                 meta  = entry.data_dict['metadata']
                 title = (
-                    f"{meta['swath_name']} · "
-                    f"Ch {entry.channel} · "
+                    f"{meta['swath_name']} \u00b7 "
+                    f"Ch {entry.channel} \u00b7 "
                     f"{meta['dtype_name']}"
                 )
                 panels.append({
@@ -746,7 +886,7 @@ class OGPRViewerMainWindow(QMainWindow):
             self, 'About OGPR Radar Viewer',
             '<h3>OGPR Radar Viewer v2.3</h3>'
             '<p>Processing based on:<br>'
-            '<i>Goodman &amp; Piro (2013) – GPR Remote Sensing in Archaeology, Ch.3</i></p>'
+            '<i>Goodman &amp; Piro (2013) \u2013 GPR Remote Sensing in Archaeology, Ch.3</i></p>'
         )
 
     def _open_log(self):
