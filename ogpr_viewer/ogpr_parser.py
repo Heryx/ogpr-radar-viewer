@@ -5,11 +5,12 @@ Handles reading and parsing of .ogpr format GPR data files.
 Supports OGPR format versions 1.x and 2.x.
 Supports IDS Stream UP (float32) and IDS Stream DP (int16) antenna types.
 
-Header format (fields separated by newlines):
-  Line 0: "ogpr"
-  Line 1: UUID  (32 hex chars)
-  Line 2: data offset  (8 hex chars)
-  Remaining bytes up to data_offset: JSON descriptor
+Header format (newline-separated text lines):
+  Line 1: "ogpr"
+  Line 2: UUID  (32 hex chars)
+  Line 3: data offset  (8 hex chars, used only as cross-check)
+  Remaining text: JSON descriptor  <- read by brace-balancing, NOT by byte offset
+  After JSON: binary data blocks
 """
 
 import json
@@ -48,12 +49,12 @@ class OGPRParser:
         self._file_size = self.filepath.stat().st_size
 
     # ------------------------------------------------------------------
-    # Header / JSON
+    # Low-level helpers
     # ------------------------------------------------------------------
 
     @staticmethod
     def _read_line(f) -> str:
-        """Read one newline-terminated text line from a binary file handle."""
+        """Read one newline-terminated ASCII line from a binary file handle."""
         buf = b''
         while True:
             ch = f.read(1)
@@ -62,50 +63,110 @@ class OGPRParser:
             buf += ch
         return buf.decode('ascii').strip()
 
+    @staticmethod
+    def _read_json_by_braces(f) -> str:
+        """
+        Read exactly one complete JSON object from the current file position
+        by counting opening/closing braces.
+
+        Reads byte-by-byte and decodes each byte as latin-1 so that any
+        stray non-UTF-8 byte outside the JSON string values is handled
+        safely.  Once the JSON object is complete (depth reaches 0) we stop
+        immediately — binary data beyond that point is never touched.
+
+        Returns the JSON text as a str.
+        """
+        buf        = []
+        depth      = 0
+        in_string  = False
+        escape_next = False
+        started    = False
+
+        while True:
+            byte = f.read(1)
+            if not byte:
+                break                       # EOF
+
+            ch = byte.decode('latin-1')     # safe for any byte value
+
+            if escape_next:
+                buf.append(ch)
+                escape_next = False
+                continue
+
+            if in_string:
+                buf.append(ch)
+                if ch == '\\':
+                    escape_next = True
+                elif ch == '"':
+                    in_string = False
+                continue
+
+            # outside a string
+            if ch == '"':
+                in_string = True
+                buf.append(ch)
+            elif ch == '{':
+                depth += 1
+                started = True
+                buf.append(ch)
+            elif ch == '}':
+                depth -= 1
+                buf.append(ch)
+                if started and depth == 0:
+                    break               # JSON object complete
+            else:
+                if started:
+                    buf.append(ch)
+                # before the first '{': skip whitespace/newlines silently
+
+        return ''.join(buf)
+
+    # ------------------------------------------------------------------
+    # Header / JSON
+    # ------------------------------------------------------------------
+
     def parse_header(self) -> Dict:
         """
         Parse OGPR file header and JSON descriptor.
 
-        The header consists of three newline-separated text lines:
-          1. signature  -> must be 'ogpr'
-          2. UUID       -> 32 hex characters
-          3. data offset -> 8 hex characters (big-endian uint32 as hex string)
-
-        Everything from after those three lines up to byte <data_offset>
-        is the UTF-8 JSON descriptor.
+        Steps:
+          1. Read three newline-delimited ASCII lines: signature, UUID, offset.
+          2. Read JSON by brace-balancing (safe against encoding issues).
+          3. Parse JSON with json.loads().
         """
         with open(self.filepath, 'rb') as f:
+
             # --- line 1: signature ---
             signature = self._read_line(f)
             if signature != 'ogpr':
                 raise ValueError(
-                    f"Invalid OGPR signature: '{signature}' "
-                    f"(expected 'ogpr')"
+                    f"Invalid OGPR signature: '{signature}' (expected 'ogpr')"
                 )
 
             # --- line 2: UUID ---
-            uuid = self._read_line(f)  # noqa: F841  (stored for future use)
+            _uuid = self._read_line(f)  # noqa: F841
 
-            # --- line 3: data offset (hex) ---
+            # --- line 3: data offset (used only for diagnostics) ---
             offset_hex = self._read_line(f).strip()
             try:
-                data_offset = int(offset_hex, 16)
+                self._data_offset = int(offset_hex, 16)
             except ValueError as exc:
                 raise ValueError(
                     f"Cannot parse data offset '{offset_hex}' as hex: {exc}"
                 ) from exc
 
-            # --- JSON descriptor ---
-            current_pos = f.tell()
-            json_size   = data_offset - current_pos
-            if json_size <= 0:
-                raise ValueError(
-                    f"data_offset ({data_offset}) <= current position "
-                    f"({current_pos}); file may be corrupted."
-                )
-            json_raw = f.read(json_size).decode('utf-8').strip()
+            # --- JSON: read by brace-balancing ---
+            json_text = self._read_json_by_braces(f)
 
-        self.descriptor = json.loads(json_raw)
+        if not json_text:
+            raise ValueError("No JSON descriptor found in file.")
+
+        try:
+            self.descriptor = json.loads(json_text)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Invalid JSON descriptor: {exc}") from exc
+
         return self.descriptor
 
     # ------------------------------------------------------------------
