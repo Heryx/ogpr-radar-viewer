@@ -13,10 +13,13 @@ Header format (newline-separated text lines):
   After JSON: binary data blocks
 """
 
+import logging
 import json
 import numpy as np
 from pathlib import Path
 from typing import Dict, Optional
+
+LOG = logging.getLogger('ogpr_viewer')
 
 
 class OGPRParser:
@@ -37,6 +40,8 @@ class OGPRParser:
         np.float32: 4,
         np.int16:   2,
     }
+    # Max tolerated size mismatch (bytes) before raising an error
+    _BYTE_SIZE_TOLERANCE = 0
 
     def __init__(self, filepath: str):
         self.filepath = Path(filepath)
@@ -177,7 +182,12 @@ class OGPRParser:
         for block in self.descriptor['dataBlockDescriptors']:
             if block['type'] == 'Radar Volume':
                 vtype = block.get('valueType', 'float').lower()
-                return self._DTYPE_MAP.get(vtype, np.float32)
+                dtype = self._DTYPE_MAP.get(vtype, np.float32)
+                LOG.debug(
+                    f'dtype detection: valueType="{vtype}" -> {dtype.__name__}'
+                )
+                return dtype
+        LOG.warning('No Radar Volume block found in descriptor, defaulting to float32')
         return np.float32
 
     # ------------------------------------------------------------------
@@ -207,8 +217,8 @@ class OGPRParser:
             'swath_name':       main.get('metadata', {}).get('swathName', 'Unknown'),
             'array_id':         main.get('metadata', {}).get('arrayId', 0),
             'version':          self.descriptor.get('version', {'major': 1, 'minor': 0}),
-            'dtype':            dtype,
-            'dtype_name':       'float32' if dtype == np.float32 else 'int16',
+            'dtype':            dtype.__name__,
+            'dtype_name':       dtype.__name__,
         }
 
     # ------------------------------------------------------------------
@@ -234,11 +244,34 @@ class OGPRParser:
         itemsize = self._DTYPE_BYTES[dtype]
 
         expected = samples * channels * slices * itemsize
+
+        LOG.debug(
+            f'Radar Volume block: byteOffset={byte_offset}  byteSize={byte_size}  '
+            f'expected={expected}  dtype={dtype.__name__}  '
+            f'shape=({samples},{channels},{slices})'
+        )
+
         if byte_size != expected:
-            print(
-                f"[OGPR] Warning: expected {expected} bytes for "
-                f"{dtype.__name__} volume, got {byte_size}."
-            )
+            # Check if data would fit perfectly as the other dtype
+            other_dtype   = np.int16   if dtype == np.float32 else np.float32
+            other_bytes   = self._DTYPE_BYTES[other_dtype]
+            other_expected = samples * channels * slices * other_bytes
+
+            if byte_size == other_expected:
+                LOG.warning(
+                    f'byte_size mismatch: descriptor says valueType maps to '
+                    f'{dtype.__name__} (expected {expected} bytes) but actual '
+                    f'byte_size={byte_size} matches {other_dtype.__name__} '
+                    f'({other_expected} bytes). Switching dtype to {other_dtype.__name__}.'
+                )
+                dtype    = other_dtype
+                itemsize = self._DTYPE_BYTES[dtype]
+            else:
+                LOG.warning(
+                    f'byte_size mismatch: expected {expected} bytes for '
+                    f'{dtype.__name__} volume, got {byte_size}. '
+                    f'Data may be corrupt or truncated.'
+                )
 
         shape = (samples, channels, slices)
 
@@ -255,6 +288,7 @@ class OGPRParser:
 
         # Always process as float32
         if dtype == np.int16:
+            LOG.debug('Converting int16 -> float32')
             data = data.astype(np.float32)
 
         self.radar_data = data
@@ -299,7 +333,7 @@ class OGPRParser:
                 self.geolocations = data.reshape(shape)
                 return self.geolocations
 
-        print(f"[OGPR] Warning: geolocations size {data.size} doesn't match known shapes.")
+        LOG.warning(f'Geolocations size {data.size} does not match any known shape')
         self.geolocations = data
         return data
 
