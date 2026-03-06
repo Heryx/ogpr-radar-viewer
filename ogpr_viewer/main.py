@@ -67,6 +67,8 @@ def _setup_logger() -> logging.Logger:
 
 
 LOG = _setup_logger()
+logging.getLogger('matplotlib').setLevel(logging.WARNING)
+logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING)
 
 
 # ---------------------------------------------------------------------------
@@ -501,6 +503,19 @@ class OGPRViewerMainWindow(QMainWindow):
             return
 
         try:
+            def _json_default(o):
+                if isinstance(o, (np.integer, np.floating)):
+                    return o.item()
+                if isinstance(o, np.ndarray):
+                    return o.tolist()
+                if isinstance(o, Path):
+                    return str(o)
+                if isinstance(o, np.dtype):
+                    return str(o)
+                if isinstance(o, type):
+                    return o.__name__
+                return str(o)
+
             with tempfile.TemporaryDirectory() as tmp:
                 tmp = Path(tmp)
 
@@ -543,6 +558,7 @@ class OGPRViewerMainWindow(QMainWindow):
                             },
                             ensure_ascii=False,
                             indent=2,
+                            default=_json_default,
                         ),
                         encoding="utf-8",
                     )
@@ -592,7 +608,7 @@ class OGPRViewerMainWindow(QMainWindow):
                         pass
 
                 (tmp / "manifest.json").write_text(
-                    json.dumps(manifest, ensure_ascii=False, indent=2),
+                    json.dumps(manifest, ensure_ascii=False, indent=2, default=_json_default),
                     encoding="utf-8",
                 )
 
