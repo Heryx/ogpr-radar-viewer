@@ -11,6 +11,11 @@ Header format (newline-separated text lines):
   Line 3: data offset  (8 hex chars, used only as cross-check)
   Remaining text: JSON descriptor  <- read by brace-balancing, NOT by byte offset
   After JSON: binary data blocks
+
+On-disk memory layout (IDS format):
+  Data is written trace-by-trace: for each slice, all channels, all samples.
+  Binary order: (slices, channels, samples)  <- C-order on disk
+  After reshape + transpose -> (samples, channels, slices)  <- viewer convention
 """
 
 import logging
@@ -40,8 +45,6 @@ class OGPRParser:
         np.float32: 4,
         np.int16:   2,
     }
-    # Max tolerated size mismatch (bytes) before raising an error
-    _BYTE_SIZE_TOLERANCE = 0
 
     def __init__(self, filepath: str):
         self.filepath = Path(filepath)
@@ -73,26 +76,18 @@ class OGPRParser:
         """
         Read exactly one complete JSON object from the current file position
         by counting opening/closing braces.
-
-        Reads byte-by-byte and decodes each byte as latin-1 so that any
-        stray non-UTF-8 byte outside the JSON string values is handled
-        safely.  Once the JSON object is complete (depth reaches 0) we stop
-        immediately — binary data beyond that point is never touched.
-
-        Returns the JSON text as a str.
         """
-        buf        = []
-        depth      = 0
-        in_string  = False
+        buf         = []
+        depth       = 0
+        in_string   = False
         escape_next = False
-        started    = False
+        started     = False
 
         while True:
             byte = f.read(1)
             if not byte:
-                break                       # EOF
-
-            ch = byte.decode('latin-1')     # safe for any byte value
+                break
+            ch = byte.decode('latin-1')
 
             if escape_next:
                 buf.append(ch)
@@ -107,7 +102,6 @@ class OGPRParser:
                     in_string = False
                 continue
 
-            # outside a string
             if ch == '"':
                 in_string = True
                 buf.append(ch)
@@ -119,11 +113,10 @@ class OGPRParser:
                 depth -= 1
                 buf.append(ch)
                 if started and depth == 0:
-                    break               # JSON object complete
+                    break
             else:
                 if started:
                     buf.append(ch)
-                # before the first '{': skip whitespace/newlines silently
 
         return ''.join(buf)
 
@@ -132,27 +125,13 @@ class OGPRParser:
     # ------------------------------------------------------------------
 
     def parse_header(self) -> Dict:
-        """
-        Parse OGPR file header and JSON descriptor.
-
-        Steps:
-          1. Read three newline-delimited ASCII lines: signature, UUID, offset.
-          2. Read JSON by brace-balancing (safe against encoding issues).
-          3. Parse JSON with json.loads().
-        """
         with open(self.filepath, 'rb') as f:
-
-            # --- line 1: signature ---
             signature = self._read_line(f)
             if signature != 'ogpr':
                 raise ValueError(
                     f"Invalid OGPR signature: '{signature}' (expected 'ogpr')"
                 )
-
-            # --- line 2: UUID ---
-            _uuid = self._read_line(f)  # noqa: F841
-
-            # --- line 3: data offset (used only for diagnostics) ---
+            _uuid      = self._read_line(f)
             offset_hex = self._read_line(f).strip()
             try:
                 self._data_offset = int(offset_hex, 16)
@@ -160,13 +139,10 @@ class OGPRParser:
                 raise ValueError(
                     f"Cannot parse data offset '{offset_hex}' as hex: {exc}"
                 ) from exc
-
-            # --- JSON: read by brace-balancing ---
             json_text = self._read_json_by_braces(f)
 
         if not json_text:
             raise ValueError("No JSON descriptor found in file.")
-
         try:
             self.descriptor = json.loads(json_text)
         except json.JSONDecodeError as exc:
@@ -183,9 +159,7 @@ class OGPRParser:
             if block['type'] == 'Radar Volume':
                 vtype = block.get('valueType', 'float').lower()
                 dtype = self._DTYPE_MAP.get(vtype, np.float32)
-                LOG.debug(
-                    f'dtype detection: valueType="{vtype}" -> {dtype.__name__}'
-                )
+                LOG.debug(f'dtype detection: valueType="{vtype}" -> {dtype.__name__}')
                 return dtype
         LOG.warning('No Radar Volume block found in descriptor, defaulting to float32')
         return np.float32
@@ -252,41 +226,53 @@ class OGPRParser:
         )
 
         if byte_size != expected:
-            # Check if data would fit perfectly as the other dtype
-            other_dtype   = np.int16   if dtype == np.float32 else np.float32
-            other_bytes   = self._DTYPE_BYTES[other_dtype]
+            other_dtype    = np.int16   if dtype == np.float32 else np.float32
+            other_bytes    = self._DTYPE_BYTES[other_dtype]
             other_expected = samples * channels * slices * other_bytes
 
             if byte_size == other_expected:
                 LOG.warning(
-                    f'byte_size mismatch: descriptor says valueType maps to '
-                    f'{dtype.__name__} (expected {expected} bytes) but actual '
-                    f'byte_size={byte_size} matches {other_dtype.__name__} '
-                    f'({other_expected} bytes). Switching dtype to {other_dtype.__name__}.'
+                    f'byte_size mismatch: descriptor says {dtype.__name__} '
+                    f'(expected {expected} bytes) but byte_size={byte_size} '
+                    f'matches {other_dtype.__name__}. Switching dtype.'
                 )
                 dtype    = other_dtype
                 itemsize = self._DTYPE_BYTES[dtype]
             else:
                 LOG.warning(
                     f'byte_size mismatch: expected {expected} bytes for '
-                    f'{dtype.__name__} volume, got {byte_size}. '
-                    f'Data may be corrupt or truncated.'
+                    f'{dtype.__name__}, got {byte_size}. Data may be corrupt.'
                 )
 
-        shape = (samples, channels, slices)
+        # IDS on-disk layout: (slices, channels, samples) — C-order
+        # We read with the correct on-disk shape, then transpose to
+        # viewer convention: (samples, channels, slices)
+        disk_shape   = (slices, channels, samples)
+        viewer_shape = (samples, channels, slices)  # after transpose
 
         if lazy:
-            data = np.memmap(
+            # memmap with disk shape, then transpose to a view
+            raw = np.memmap(
                 self.filepath, dtype=dtype, mode='r',
-                offset=byte_offset, shape=shape
+                offset=byte_offset, shape=disk_shape
+            )
+            # np.transpose returns a view — no copy, memory-efficient
+            data = np.transpose(raw, (2, 1, 0))
+            LOG.debug(
+                f'memmap loaded: disk_shape={disk_shape} '
+                f'-> transposed viewer_shape={data.shape}'
             )
         else:
             with open(self.filepath, 'rb') as f:
                 f.seek(byte_offset)
                 raw = f.read(byte_size)
-            data = np.frombuffer(raw, dtype=dtype).reshape(shape)
+            data = np.frombuffer(raw, dtype=dtype).reshape(disk_shape)
+            data = np.ascontiguousarray(np.transpose(data, (2, 1, 0)))
+            LOG.debug(
+                f'loaded: disk_shape={disk_shape} '
+                f'-> transposed viewer_shape={data.shape}'
+            )
 
-        # Always process as float32
         if dtype == np.int16:
             LOG.debug('Converting int16 -> float32')
             data = data.astype(np.float32)
