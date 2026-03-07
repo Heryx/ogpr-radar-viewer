@@ -171,6 +171,15 @@ class SignalProcessor:
         """
         Subtract mean or median trace to remove horizontal banding.
 
+        WARNING: Background removal may produce blank output on int16 data
+        with saturated direct wave (±32k counts). This occurs because:
+        - Direct wave saturates entire dynamic range
+        - Subsurface signals < 1 LSB (invisible in int16)
+        - All traces are identical → bg_removal subtracts everything
+        
+        For int16 saturated data: use dewow + AGC only, skip bg_removal.
+        For float32 v2.0 data: bg_removal should work correctly.
+
         Args:
             method:        'mean' or 'median'
             rolling:       If True, compute background from a sliding window
@@ -199,6 +208,9 @@ class SignalProcessor:
         n_smp = data.shape[0]
         n_trc = data.shape[1]
         half  = window_traces // 2
+
+        # Compute std before background removal for saturation detection
+        std_before = float(np.std(data))
 
         # Validate sample range
         if sample_start is not None:
@@ -250,10 +262,27 @@ class SignalProcessor:
                 out[sample_start:sample_end, i] -= bg_subset
             data = out
 
+        # Check for saturation-induced blanking
+        std_after = float(np.std(data))
+        if std_before > 0:
+            ratio = std_after / std_before
+            if ratio < 0.01:  # Less than 1% of original variance remains
+                LOG.warning(
+                    f'Background removal produced near-zero output '
+                    f'(std_after/std_before = {ratio:.6f}). '
+                    f'This typically indicates int16 data with saturated direct wave. '
+                    f'Subsurface signal < 1 LSB is invisible in int16. '
+                    f'Recommendation: DISABLE background removal, use dewow + AGC only. '
+                    f'Background removal is useful only for float32 v2.0 data '
+                    f'or int16 with strong subsurface reflectors (>50% of dynamic range).'
+                )
+
         range_str = f'[{sample_start}:{sample_end}]' if (sample_start > 0 or sample_end < n_smp) else 'all'
         LOG.debug(
             f'Background removal: method={method} rolling={rolling} '
-            f'win={window_traces} sample_range={range_str}'
+            f'win={window_traces} sample_range={range_str} '
+            f'std_before={std_before:.2f} std_after={std_after:.2f} '
+            f'ratio={std_after/std_before if std_before > 0 else 0:.4f}'
         )
         self.processed_data = data
         return data
