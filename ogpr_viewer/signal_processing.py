@@ -102,10 +102,10 @@ class SignalProcessor:
              - 'threshold': first sample exceeding threshold * max_amplitude
              - 'max':       sample of maximum absolute amplitude
           2. Shift all traces so every first-break aligns to the median
-             first-break position.
+             first-break position. Use edge padding instead of zero padding
+             to prevent artifacts (black lines on edges).
           3. Crop the profile: remove the first med samples (pre-trigger
-             noise / air gap before the antenna fires).  After this step
-             the profile starts at t = 0 (first break = surface).
+             noise / air gap before the antenna fires).
         """
         data     = self.processed_data
         n_smp    = data.shape[0]
@@ -123,11 +123,19 @@ class SignalProcessor:
 
         med = int(np.median(tz))
         out = np.zeros_like(data)
+        
         for i in range(n_trc):
             shift = med - tz[i]
-            if   shift > 0: out[shift:,         i] = data[: n_smp - shift, i]
-            elif shift < 0: out[: n_smp + shift, i] = data[-shift:,        i]
-            else:           out[:, i] = data[:, i]
+            if shift > 0: 
+                # Shift down: pad top with edge value
+                out[shift:, i] = data[:n_smp - shift, i]
+                out[:shift, i] = data[0, i]  # Edge padding instead of zeros
+            elif shift < 0: 
+                # Shift up: pad bottom with edge value
+                out[:n_smp + shift, i] = data[-shift:, i]
+                out[n_smp + shift:, i] = data[-1, i]  # Edge padding instead of zeros
+            else:           
+                out[:, i] = data[:, i]
 
         if med > 0:
             out = out[med:, :]
@@ -149,7 +157,20 @@ class SignalProcessor:
         kernel = np.ones(w, dtype=np.float32) / w
 
         for i in range(data.shape[1]):
-            ma = np.convolve(data[:, i], kernel, mode='same')
+            # Use 'reflect' padding implicitly via numpy if we can,
+            # but convolve mode='same' pads with zeros.
+            # To fix edge artifacts in dewow, we should pad the trace before convolution
+            pad_w = w // 2
+            padded = np.pad(data[:, i], pad_w, mode='edge')
+            ma = np.convolve(padded, kernel, mode='valid')
+            
+            # Ensure sizes match (handling even/odd window sizes)
+            if len(ma) > len(data[:, i]):
+                ma = ma[:len(data[:, i])]
+            elif len(ma) < len(data[:, i]):
+                # Fallback to standard if size mismatch
+                ma = np.convolve(data[:, i], kernel, mode='same')
+                
             data[:, i] -= ma
 
         LOG.debug(f'Dewow: window={w} samples')
@@ -309,7 +330,11 @@ class SignalProcessor:
             sos  = sp_signal.butter(order, [lo, hi], btype='band', output='sos')
             data = self.processed_data.copy()
             for i in range(data.shape[1]):
-                data[:, i] = sp_signal.sosfiltfilt(sos, data[:, i])
+                # Add edge padding to avoid ringing at start/end of traces
+                pad_len = 50
+                padded = np.pad(data[:, i], pad_len, mode='edge')
+                filtered = sp_signal.sosfiltfilt(sos, padded)
+                data[:, i] = filtered[pad_len:-pad_len]
             LOG.debug(f'Bandpass: {low_freq}-{high_freq} MHz order={order}')
             self.processed_data = data
         except Exception as e:
