@@ -255,7 +255,7 @@ class OGPRViewerMainWindow(QMainWindow):
         scroll.setWidget(self._sidebar_inner)
         v.addWidget(scroll)
 
-        btn = QPushButton('\u2795  Open file(s)…')
+        btn = QPushButton('\u2795  Open file(s)\u2026')
         btn.clicked.connect(self.open_files)
         v.addWidget(btn)
         return c
@@ -278,7 +278,6 @@ class OGPRViewerMainWindow(QMainWindow):
         hdr.setFont(QFont('', 9, QFont.Weight.Bold))
         layout.addWidget(hdr)
 
-        # Processing groups
         layout.addWidget(self._grp_timezero())
         layout.addWidget(self._grp_dewow())
         layout.addWidget(self._grp_background())
@@ -288,8 +287,7 @@ class OGPRViewerMainWindow(QMainWindow):
         layout.addWidget(self._grp_gain())
         layout.addWidget(self._grp_hilbert_norm())
         layout.addWidget(self._grp_migration())
-
-        # Display (colormap + Y-axis + velocity)
+        layout.addWidget(self._grp_view())        # <-- view / trace range
         layout.addWidget(self._grp_display())
         layout.addWidget(self._grp_export())
         layout.addStretch()
@@ -369,7 +367,7 @@ class OGPRViewerMainWindow(QMainWindow):
         self._dspin(v, '  Low:',   'bp_low',   1.0, 4000.0, 100.0, 10.0, ' MHz')
         self._dspin(v, '  High:',  'bp_high',  1.0, 4000.0, 800.0, 10.0, ' MHz')
         self._ispin(v, '  Order:', 'bp_order', 1, 8, 4)
-        btn = QPushButton('\U0001f4c8  Power spectrum…')
+        btn = QPushButton('\U0001f4c8  Power spectrum\u2026')
         btn.clicked.connect(self._show_power_spectrum)
         v.addWidget(btn)
         g.setLayout(v); return g
@@ -396,7 +394,7 @@ class OGPRViewerMainWindow(QMainWindow):
         ))
         self._dspin(v, '  Factor (exp/lin):',    'gain_factor', 0.1, 20.0, 2.0, 0.1)
         self._dspin(v, '  \u03b1 (SEC) [1/ns]:',      'gain_alpha',  0.0,  5.0, 0.5, 0.05)
-        self._dspin(v, '  t-start (SEC) [ns]:', 'gain_tstart', 0.0, 100.0, 0.0, 0.5, ' ns')
+        self._dspin(v, '  t-start [ns]:', 'gain_tstart', 0.0, 100.0, 0.0, 0.5, ' ns')
         self._dspin(v, '  AGC window:',          'gain_agc_win',1.0, 500.0, 50.0, 5.0, ' ns')
         g.setLayout(v); return g
 
@@ -417,19 +415,60 @@ class OGPRViewerMainWindow(QMainWindow):
         g.setLayout(v); return g
 
     # ------------------------------------------------------------------
+    # View / trace-range group  (scroll long profiles)
+    # ------------------------------------------------------------------
+
+    def _grp_view(self):
+        g = QGroupBox('View  (trace range)'); v = QVBoxLayout()
+
+        self.cb_limit_view = QCheckBox('Limit to range')
+        self.cb_limit_view.stateChanged.connect(self._apply_and_render)
+        v.addWidget(self.cb_limit_view)
+
+        row1 = QHBoxLayout()
+        row1.addWidget(QLabel('  Start trace:'))
+        self.view_start = QSpinBox()
+        self.view_start.setRange(0, 9_999_999)
+        self.view_start.setValue(0)
+        self.view_start.setSingleStep(500)
+        self.view_start.setSuffix(' trc')
+        self.view_start.valueChanged.connect(self._on_view_range_changed)
+        row1.addWidget(self.view_start)
+        v.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel('  Width:'))
+        self.view_width = QSpinBox()
+        self.view_width.setRange(10, 9_999_999)
+        self.view_width.setValue(5000)
+        self.view_width.setSingleStep(500)
+        self.view_width.setSuffix(' trc')
+        self.view_width.valueChanged.connect(self._on_view_range_changed)
+        row2.addWidget(self.view_width)
+        v.addLayout(row2)
+
+        v.addWidget(QLabel(
+            '<small><i>5000 trc ≈ 200 m  (at dx=0.04 m)</i></small>'
+        ))
+        g.setLayout(v); return g
+
+    def _on_view_range_changed(self):
+        """Re-render only when view limiting is actually active."""
+        if self.cb_limit_view.isChecked():
+            self._apply_and_render()
+
+    # ------------------------------------------------------------------
     # Display group  (colormap + Y-axis + velocity)
     # ------------------------------------------------------------------
 
     def _grp_display(self):
         g = QGroupBox('Display'); v = QVBoxLayout()
 
-        # Colormap
         self._combo(v, 'Colormap:', 'cmap_combo',
                     ['gray', 'seismic', 'RdBu_r', 'viridis', 'jet', 'hot', 'bwr'])
 
         v.addWidget(_hsep())
 
-        # --- Y-axis mode ---
         v.addWidget(QLabel('Y axis:'))
         self.ymode_grp = QButtonGroup(self)
         for label, mode in [
@@ -448,7 +487,6 @@ class OGPRViewerMainWindow(QMainWindow):
 
         v.addWidget(_hsep())
 
-        # --- Velocity  (shared by depth conversion + migration) ---
         v.addWidget(QLabel('EM Velocity  [m/ns]:'))
         v.addWidget(QLabel(
             '<small>dry sand 0.12\u20130.15 \u00b7 moist soil 0.08\u20130.10<br>'
@@ -475,160 +513,13 @@ class OGPRViewerMainWindow(QMainWindow):
 
     def _grp_export(self):
         g = QGroupBox('Export'); v = QVBoxLayout()
-
         btn = QPushButton('Export current view\u2026')
         btn.clicked.connect(self._export)
         v.addWidget(btn)
-
         dbg = QPushButton('Export debug bundle (.zip)\u2026')
         dbg.clicked.connect(self._export_debug_bundle)
         v.addWidget(dbg)
-
         g.setLayout(v); return g
-
-    def _export_debug_bundle(self):
-        visible = [e for e in self._swath_entries if e.visible]
-        if not visible:
-            QMessageBox.information(self, 'Debug export', 'No swaths visible.')
-            return
-
-        p = self._params()
-        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-        default_name = str(Path(self.last_directory) / f'ogpr_debug_{ts}.zip')
-
-        zip_path, _ = QFileDialog.getSaveFileName(
-            self, 'Export debug bundle', default_name, 'ZIP (*.zip);;All Files (*)'
-        )
-        if not zip_path:
-            return
-
-        try:
-            def _json_default(o):
-                if isinstance(o, (np.integer, np.floating)):
-                    return o.item()
-                if isinstance(o, np.ndarray):
-                    return o.tolist()
-                if isinstance(o, Path):
-                    return str(o)
-                if isinstance(o, np.dtype):
-                    return str(o)
-                if isinstance(o, type):
-                    return o.__name__
-                return str(o)
-
-            with tempfile.TemporaryDirectory() as tmp:
-                tmp = Path(tmp)
-
-                manifest = {
-                    "created": ts,
-                    "params": p,
-                    "swaths": [],
-                }
-
-                for entry in visible:
-                    meta = entry.data_dict["metadata"]
-                    swath_name = meta.get("swath_name", "swath")
-                    ch = entry.channel
-
-                    rv = entry.data_dict["radar_volume"]
-                    raw = np.asarray(rv[:, ch, :], dtype=np.float32)
-
-                    processed, time_axis, dx_m = self._process_swath(entry, p)
-
-                    base = f"{swath_name}_ch{ch}"
-                    npz_path = tmp / f"{base}.npz"
-                    np.savez_compressed(
-                        npz_path,
-                        raw=raw,
-                        processed=np.asarray(processed, dtype=np.float32),
-                        time_ns=np.asarray(time_axis, dtype=np.float32),
-                        trace_spacing_m=float(dx_m),
-                        sampling_time_ns=float(meta.get("sampling_time_ns", np.nan)),
-                    )
-
-                    json_path = tmp / f"{base}_meta.json"
-                    json_path.write_text(
-                        json.dumps(
-                            {
-                                "filepath": entry.data_dict.get("filepath", ""),
-                                "swath_name": swath_name,
-                                "channel": ch,
-                                "metadata": meta,
-                                "params": p,
-                            },
-                            ensure_ascii=False,
-                            indent=2,
-                            default=_json_default,
-                        ),
-                        encoding="utf-8",
-                    )
-
-                    manifest["swaths"].append(
-                        {
-                            "swath": swath_name,
-                            "channel": ch,
-                            "npz": npz_path.name,
-                            "meta": json_path.name,
-                            "shape_raw": list(raw.shape),
-                            "shape_processed": list(np.asarray(processed).shape),
-                        }
-                    )
-
-                    # Quicklook PNG (raw vs processed)
-                    try:
-                        from matplotlib.figure import Figure
-
-                        fig = Figure(figsize=(10, 4), dpi=150)
-                        ax1 = fig.add_subplot(1, 2, 1)
-                        ax2 = fig.add_subplot(1, 2, 2)
-
-                        def _lims(a):
-                            vmin = float(np.percentile(a, 2))
-                            vmax = float(np.percentile(a, 98))
-                            if vmax <= vmin:
-                                vmax = vmin + 1.0
-                            return vmin, vmax
-
-                        vmin_r, vmax_r = _lims(raw)
-                        vmin_p, vmax_p = _lims(processed)
-
-                        ax1.imshow(raw, aspect="auto", cmap="gray", vmin=vmin_r, vmax=vmax_r)
-                        ax1.set_title("RAW")
-                        ax1.set_xlabel("Trace")
-                        ax1.set_ylabel("Sample")
-
-                        ax2.imshow(processed, aspect="auto", cmap="gray", vmin=vmin_p, vmax=vmax_p)
-                        ax2.set_title("PROCESSED")
-                        ax2.set_xlabel("Trace")
-                        ax2.set_ylabel("Sample")
-
-                        fig.tight_layout()
-                        fig.savefig(tmp / f"{base}_quicklook.png")
-                    except Exception:
-                        pass
-
-                (tmp / "manifest.json").write_text(
-                    json.dumps(manifest, ensure_ascii=False, indent=2, default=_json_default),
-                    encoding="utf-8",
-                )
-
-                log_path = Path(sys.argv[0]).parent / "ogpr_viewer_debug.log"
-                if log_path.exists():
-                    try:
-                        (tmp / "ogpr_viewer_debug.log").write_bytes(log_path.read_bytes())
-                    except Exception:
-                        pass
-
-                with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
-                    for f in tmp.rglob("*"):
-                        if f.is_file():
-                            z.write(f, arcname=f.name)
-
-            self.status.showMessage(f"Debug bundle exported: {Path(zip_path).name}", 6000)
-
-        except Exception as e:
-            LOG.error(f"Debug export error: {e}\n{traceback.format_exc()}")
-            QMessageBox.critical(self, "Debug export error", str(e))
 
     # ------------------------------------------------------------------
     # Menu / Status
@@ -701,6 +592,18 @@ class OGPRViewerMainWindow(QMainWindow):
             5000,
         )
         LOG.info(f"Swath added: {meta['swath_name']}")
+
+        # Update view range spinbox bounds to the largest loaded swath
+        max_slices = max(
+            e.data_dict['metadata']['slices_count']
+            for e in self._swath_entries
+        )
+        self.view_start.setMaximum(max(0, max_slices - 1))
+        self.view_width.setMaximum(max_slices)
+        # Default width: first 5000 traces (keeps the profile readable)
+        if not self.cb_limit_view.isChecked():
+            self.view_width.setValue(min(5000, max_slices))
+
         self._apply_and_render()
 
     def _on_error(self, msg: str):
@@ -831,6 +734,21 @@ class OGPRViewerMainWindow(QMainWindow):
                     f"Ch {entry.channel} \u00b7 "
                     f"{meta['dtype_name']}"
                 )
+
+                # Apply view window: slice to the requested trace range
+                if self.cb_limit_view.isChecked():
+                    n_trc = data.shape[1]
+                    vs    = max(0, min(self.view_start.value(), n_trc - 1))
+                    vw    = max(1, min(self.view_width.value(), n_trc - vs))
+                    data  = data[:, vs:vs + vw]
+                    x0_m  = vs * dx_m
+                    x1_m  = (vs + vw - 1) * dx_m
+                    title += f'  [{x0_m:.0f}\u2013{x1_m:.0f} m]'
+                    LOG.debug(
+                        f'View window: traces {vs}..{vs+vw-1}  '
+                        f'({x0_m:.1f}\u2013{x1_m:.1f} m)  data_shape={data.shape}'
+                    )
+
                 panels.append({
                     'data':             data,
                     'time_axis':        time_axis,
@@ -870,18 +788,8 @@ class OGPRViewerMainWindow(QMainWindow):
         PowerSpectrumDialog(freqs, pdb, self).exec()
 
     # ------------------------------------------------------------------
-    # Misc
+    # Export
     # ------------------------------------------------------------------
-
-    def _reset_filters(self):
-        for cb in [
-            self.cb_t0, self.cb_dewow, self.cb_bg, self.cb_bg_rolling,
-            self.cb_bp, self.cb_notch, self.cb_sw, self.cb_sw_bp,
-            self.cb_gain, self.cb_hilbert, self.cb_norm, self.cb_mig,
-        ]:
-            cb.blockSignals(True); cb.setChecked(False); cb.blockSignals(False)
-        self._ymode_default.setChecked(True)
-        self._apply_and_render()
 
     def _export(self):
         filename, _ = QFileDialog.getSaveFileName(
@@ -897,10 +805,132 @@ class OGPRViewerMainWindow(QMainWindow):
                 LOG.error(f'Export error: {e}\n{traceback.format_exc()}')
                 QMessageBox.critical(self, 'Export error', str(e))
 
+    def _export_debug_bundle(self):
+        visible = [e for e in self._swath_entries if e.visible]
+        if not visible:
+            QMessageBox.information(self, 'Debug export', 'No swaths visible.')
+            return
+
+        p = self._params()
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        default_name = str(Path(self.last_directory) / f'ogpr_debug_{ts}.zip')
+
+        zip_path, _ = QFileDialog.getSaveFileName(
+            self, 'Export debug bundle', default_name, 'ZIP (*.zip);;All Files (*)'
+        )
+        if not zip_path:
+            return
+
+        try:
+            def _json_default(o):
+                if isinstance(o, (np.integer, np.floating)): return o.item()
+                if isinstance(o, np.ndarray):               return o.tolist()
+                if isinstance(o, Path):                     return str(o)
+                if isinstance(o, np.dtype):                 return str(o)
+                if isinstance(o, type):                     return o.__name__
+                return str(o)
+
+            with tempfile.TemporaryDirectory() as tmp:
+                tmp = Path(tmp)
+                manifest = {'created': ts, 'params': p, 'swaths': []}
+
+                for entry in visible:
+                    meta       = entry.data_dict['metadata']
+                    swath_name = meta.get('swath_name', 'swath')
+                    ch         = entry.channel
+                    rv         = entry.data_dict['radar_volume']
+                    raw        = np.asarray(rv[:, ch, :], dtype=np.float32)
+                    processed, time_axis, dx_m = self._process_swath(entry, p)
+
+                    base     = f'{swath_name}_ch{ch}'
+                    npz_path = tmp / f'{base}.npz'
+                    np.savez_compressed(
+                        npz_path,
+                        raw=raw,
+                        processed=np.asarray(processed, dtype=np.float32),
+                        time_ns=np.asarray(time_axis, dtype=np.float32),
+                        trace_spacing_m=float(dx_m),
+                        sampling_time_ns=float(meta.get('sampling_time_ns', np.nan)),
+                    )
+
+                    json_path = tmp / f'{base}_meta.json'
+                    json_path.write_text(
+                        json.dumps(
+                            {'filepath': entry.data_dict.get('filepath', ''),
+                             'swath_name': swath_name, 'channel': ch,
+                             'metadata': meta, 'params': p},
+                            ensure_ascii=False, indent=2, default=_json_default,
+                        ),
+                        encoding='utf-8',
+                    )
+
+                    try:
+                        from matplotlib.figure import Figure
+                        fig = Figure(figsize=(10, 4), dpi=150)
+                        ax1 = fig.add_subplot(1, 2, 1)
+                        ax2 = fig.add_subplot(1, 2, 2)
+
+                        def _lims(a):
+                            vmin = float(np.percentile(a, 2))
+                            vmax = float(np.percentile(a, 98))
+                            return vmin, vmax if vmax > vmin else (vmin, vmin + 1.0)
+
+                        ax1.imshow(raw, aspect='auto', cmap='gray', vmin=_lims(raw)[0], vmax=_lims(raw)[1])
+                        ax1.set_title('RAW'); ax1.set_xlabel('Trace'); ax1.set_ylabel('Sample')
+                        ax2.imshow(processed, aspect='auto', cmap='gray',
+                                   vmin=_lims(processed)[0], vmax=_lims(processed)[1])
+                        ax2.set_title('PROCESSED'); ax2.set_xlabel('Trace'); ax2.set_ylabel('Sample')
+                        fig.tight_layout()
+                        fig.savefig(tmp / f'{base}_quicklook.png')
+                    except Exception:
+                        pass
+
+                    manifest['swaths'].append({
+                        'swath': swath_name, 'channel': ch,
+                        'npz': npz_path.name, 'meta': json_path.name,
+                        'shape_raw': list(raw.shape),
+                        'shape_processed': list(np.asarray(processed).shape),
+                    })
+
+                (tmp / 'manifest.json').write_text(
+                    json.dumps(manifest, ensure_ascii=False, indent=2, default=_json_default),
+                    encoding='utf-8',
+                )
+
+                log_path = Path(sys.argv[0]).parent / 'ogpr_viewer_debug.log'
+                if log_path.exists():
+                    try: (tmp / 'ogpr_viewer_debug.log').write_bytes(log_path.read_bytes())
+                    except Exception: pass
+
+                with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as z:
+                    for f in tmp.rglob('*'):
+                        if f.is_file(): z.write(f, arcname=f.name)
+
+            self.status.showMessage(f'Debug bundle exported: {Path(zip_path).name}', 6000)
+
+        except Exception as e:
+            LOG.error(f'Debug export error: {e}\n{traceback.format_exc()}')
+            QMessageBox.critical(self, 'Debug export error', str(e))
+
+    # ------------------------------------------------------------------
+    # Misc
+    # ------------------------------------------------------------------
+
+    def _reset_filters(self):
+        for cb in [
+            self.cb_t0, self.cb_dewow, self.cb_bg, self.cb_bg_rolling,
+            self.cb_bp, self.cb_notch, self.cb_sw, self.cb_sw_bp,
+            self.cb_gain, self.cb_hilbert, self.cb_norm, self.cb_mig,
+            self.cb_limit_view,
+        ]:
+            cb.blockSignals(True); cb.setChecked(False); cb.blockSignals(False)
+        self._ymode_default.setChecked(True)
+        self._apply_and_render()
+
     def _about(self):
         QMessageBox.about(
             self, 'About OGPR Radar Viewer',
-            '<h3>OGPR Radar Viewer v2.3</h3>'
+            '<h3>OGPR Radar Viewer v2.4</h3>'
             '<p>Processing based on:<br>'
             '<i>Goodman &amp; Piro (2013) \u2013 GPR Remote Sensing in Archaeology, Ch.3</i></p>'
         )
