@@ -9,7 +9,9 @@ MultiPanelCanvas:
   - Y axis: switchable  time (ns) | depth_rel (m) | depth_abs (m)
   - Dark theme
   - Symmetric vmin/vmax centred at zero (98th percentile of |data|)
-    so that positive and negative GPR reflections are equally visible.
+    Percentile is computed on the sub-surface portion of the data only
+    (skipping the first _DW_SKIP_FRAC of rows = direct-wave zone) so
+    that a strong direct wave cannot compress the colour scale.
 """
 
 from __future__ import annotations
@@ -36,9 +38,14 @@ LOG = logging.getLogger('ogpr_viewer')
 
 YMode = Literal['time', 'depth_rel', 'depth_abs']
 
-# Percentile of |data| used for symmetric colour clipping.
-# 98 keeps the top 2% of spikes from compressing the colour scale.
+# Percentile of |sub-surface data| used for symmetric colour clipping.
 _CLIP_PCT = 98.0
+
+# Fraction of the time axis skipped when computing the clipping percentile.
+# The first ~8 % of samples typically contain the direct wave / air coupling
+# whose amplitude can be 10-100x larger than subsurface reflections.
+# Skipping them lets the colour scale be calibrated to the subsurface.
+_DW_SKIP_FRAC = 0.08
 
 
 # ---------------------------------------------------------------------------
@@ -128,19 +135,34 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
             )
 
     @staticmethod
-    def _symmetric_clim(data: np.ndarray, pct: float = _CLIP_PCT) -> Tuple[float, float]:
+    def _symmetric_clim(
+        data: np.ndarray,
+        pct:  float = _CLIP_PCT,
+        dw_skip_frac: float = _DW_SKIP_FRAC,
+    ) -> Tuple[float, float]:
         """
         Compute a symmetric colour range centred at zero.
 
-        Uses the `pct`-th percentile of |data| so that the top (100-pct)%
-        of amplitude spikes do not compress the colour scale.  Both positive
-        and negative GPR reflections are rendered with equal contrast.
+        The percentile is computed on the *sub-surface* portion of the data:
+        the first `dw_skip_frac` rows (direct-wave zone) are excluded from
+        the calculation so that a strong direct wave cannot compress the
+        colour scale and wash out the subsurface reflections.
+
+        The direct wave itself is still drawn; it may appear saturated
+        (full white/black) which is the correct visual representation of
+        its much higher amplitude.
 
         Returns (vmin, vmax) where vmin = -vmax.
         """
-        vabs = float(np.percentile(np.abs(data), pct))
+        n_rows = data.shape[0]
+        skip   = max(0, int(n_rows * dw_skip_frac))
+        d_sub  = data[skip:, :] if n_rows > skip + 4 else data
+        vabs   = float(np.percentile(np.abs(d_sub), pct))
         if vabs < 1e-10:
-            vabs = 1.0          # avoid degenerate all-zero panels
+            # Fallback: try the full data (e.g. very short profiles)
+            vabs = float(np.percentile(np.abs(data), pct))
+        if vabs < 1e-10:
+            vabs = 1.0
         return -vabs, vabs
 
     # ------------------------------------------------------------------
@@ -155,14 +177,6 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
         velocity_m_ns: float = 0.10,
         t0_ns:         float = 0.0,
     ):
-        """
-        Render panels and cache parameters for re-render on resize.
-
-        y_mode options:
-          'time'      -> Y axis in ns
-          'depth_rel' -> Y axis depth from surface [m]  d = t*v/2
-          'depth_abs' -> Y axis depth with t0 removed   d = (t-t0)*v/2
-        """
         self._last_panels = panels
         self._last_cmap   = cmap
         self._last_y_mode = y_mode
@@ -242,16 +256,15 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
             extent = [x_min, x_max, y_bottom, y_top]
 
             try:
-                # Symmetric colour limits centred at zero:
-                # the grey point of the colormap always represents zero amplitude.
-                # Positive reflections -> white/bright, negative -> dark, zero -> mid-grey.
+                # Symmetric clipping based on sub-surface amplitude only
+                # (direct-wave rows are excluded from the percentile calculation).
                 vmin, vmax = self._symmetric_clim(data)
 
                 LOG.debug(
                     f'Panel {idx}: shape={data.shape}  '
                     f'extent={[round(v,3) for v in extent]}  '
                     f'vmin={vmin:.3g}  vmax={vmax:.3g}  '
-                    f'(symmetric {_CLIP_PCT}th-pct clipping)'
+                    f'(symm {_CLIP_PCT}th-pct, skip={_DW_SKIP_FRAC:.0%} rows)'
                 )
 
                 im = ax.imshow(
@@ -348,9 +361,11 @@ class RadarCanvas(FigureCanvasQTAgg):
         if time_axis  is None: time_axis  = np.arange(data.shape[0])
         if trace_axis is None: trace_axis = np.arange(data.shape[1])
 
-        # Symmetric clipping also for the legacy canvas
         if vmin is None or vmax is None:
-            vabs = float(np.percentile(np.abs(data), _CLIP_PCT))
+            n = data.shape[0]
+            skip = max(0, int(n * _DW_SKIP_FRAC))
+            d_sub = data[skip:, :] if n > skip + 4 else data
+            vabs  = float(np.percentile(np.abs(d_sub), _CLIP_PCT))
             if vabs < 1e-10: vabs = 1.0
             vmin, vmax = -vabs, vabs
 
