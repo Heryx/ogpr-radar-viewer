@@ -308,16 +308,14 @@ class SignalProcessor:
             g(t) = 1 + (t^2 * exp(alpha*t) / max) * (factor - 1)
             'factor' is the maximum gain multiplier at t=t_max.
             e.g. factor=20  -> 1x at surface, 20x at bottom.
-            This fixes the previous bug where factor was ignored and
-            gain was hardcoded to 1e4.
 
         gain_type='agc'
             Normalise each sample by the local RMS within window_ns.
             - RMS is computed ONLY on samples >= start_smp (direct wave
-              region is excluded to prevent it inflating the RMS).
-            - A noise floor of 5% of the per-trace global RMS prevents
-              near-zero zones (e.g. after background removal) from being
-              amplified to saturation.
+              region is excluded).
+            - Noise floor is computed from the DEEP HALF of the sub-surface
+              block (bottom 50%) to avoid ringing contamination from the
+              direct wave zone (which persists 10-20 ns after removal).
             - mode='reflect' avoids border artefacts at trace ends.
 
         Args:
@@ -348,13 +346,10 @@ class SignalProcessor:
                 g = (t_shifted ** 2) * np.exp(alpha * t_shifted)
             g_max = float(g.max())
             if g_max > 0:
-                # 'factor' is the max gain multiplier at t=t_max.
-                # g ranges from 0 at t_start to factor at t_max.
-                # We add 1.0 so there is never a gain < 1 (no attenuation).
                 g = 1.0 + (g / g_max) * max(float(factor) - 1.0, 0.0)
             else:
                 g = np.ones_like(t)
-            g[t < t_start_ns] = 1.0   # no change before t_start
+            g[t < t_start_ns] = 1.0
             LOG.debug(
                 f'SEC: factor={factor} (max_gain={factor}x at t_max)  '
                 f'alpha={alpha}  t_start={t_start_ns} ns'
@@ -366,15 +361,13 @@ class SignalProcessor:
             win_smp   = max(3, int(window_ns / self.sampling_time_ns))
             start_smp = max(0, int(t_start_ns / self.sampling_time_ns))
 
-            out = data.copy()   # pre-start rows kept as-is
+            out = data.copy()
 
             if start_smp < n_smp:
                 sub = data[start_smp:, :].astype(np.float64)
+                n_sub = sub.shape[0]
 
-                # Local RMS within the sliding window.
-                # mode='reflect' mirrors data at both ends:
-                #   - top border: avoids direct-wave bleed into sub block
-                #   - bottom border: avoids value-repetition artefact
+                # Local RMS sliding window
                 local_rms = np.sqrt(
                     uniform_filter1d(
                         sub ** 2,
@@ -384,13 +377,22 @@ class SignalProcessor:
                     )
                 )
 
-                # Noise floor: per-trace global RMS of the sub-surface block.
-                # Prevents the AGC from amplifying dead zones (near-zero
-                # amplitude after background removal) to saturation.
-                # Floor = 5% of global RMS: regions quieter than this
-                # are not boosted beyond 20x their natural level.
+                # Noise floor: compute global RMS from DEEP HALF only.
+                # After background removal, the direct-wave ringing zone
+                # (5-15 ns) still has 10-100x higher amplitude than true
+                # subsurface reflections.  Computing global_rms from the
+                # entire sub-block would yield a noise floor too high for
+                # the deeper signal, making it appear flat in the final image.
+                # Using only the bottom 50% ensures the noise floor is
+                # calibrated to actual subsurface amplitudes, not ringing.
+                mid_idx = n_sub // 2
+                if n_sub > 4:
+                    deep_half = sub[mid_idx:, :]
+                else:
+                    deep_half = sub
+
                 global_rms = np.sqrt(
-                    np.mean(sub ** 2, axis=0, keepdims=True)
+                    np.mean(deep_half ** 2, axis=0, keepdims=True)
                 )
                 noise_floor = 0.05
                 rms_floor   = np.maximum(local_rms, global_rms * noise_floor)
@@ -402,7 +404,7 @@ class SignalProcessor:
             LOG.debug(
                 f'AGC: window={window_ns} ns ({win_smp} smp)  '
                 f't_start={t_start_ns} ns ({start_smp} smp protected)  '
-                f'noise_floor=5%  sub_block={n_smp-start_smp} smp'
+                f'noise_floor=5% of deep-half global RMS  sub_block={n_smp-start_smp} smp'
             )
             return self.processed_data
 

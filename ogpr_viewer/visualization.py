@@ -10,8 +10,8 @@ MultiPanelCanvas:
   - Dark theme
   - Symmetric vmin/vmax centred at zero (98th percentile of |data|)
     Percentile is computed on the sub-surface portion of the data only
-    (skipping the first _DW_SKIP_FRAC of rows = direct-wave zone) so
-    that a strong direct wave cannot compress the colour scale.
+    (skipping the first _DW_SKIP_FRAC of rows = direct-wave + ringing zone)
+    so that strong near-surface signals cannot compress the colour scale.
 """
 
 from __future__ import annotations
@@ -42,10 +42,10 @@ YMode = Literal['time', 'depth_rel', 'depth_abs']
 _CLIP_PCT = 98.0
 
 # Fraction of the time axis skipped when computing the clipping percentile.
-# The first ~8 % of samples typically contain the direct wave / air coupling
-# whose amplitude can be 10-100x larger than subsurface reflections.
-# Skipping them lets the colour scale be calibrated to the subsurface.
-_DW_SKIP_FRAC = 0.08
+# For 600 MHz antennas, the direct wave + ringing extends to ~15-20 ns.
+# Skipping the first 25% of samples ensures the colour scale is calibrated
+# to true subsurface reflections, not the near-surface zone.
+_DW_SKIP_FRAC = 0.25
 
 
 # ---------------------------------------------------------------------------
@@ -144,13 +144,12 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
         Compute a symmetric colour range centred at zero.
 
         The percentile is computed on the *sub-surface* portion of the data:
-        the first `dw_skip_frac` rows (direct-wave zone) are excluded from
-        the calculation so that a strong direct wave cannot compress the
-        colour scale and wash out the subsurface reflections.
+        the first `dw_skip_frac` rows (direct-wave + ringing zone) are
+        excluded from the calculation so that strong near-surface signals
+        cannot compress the colour scale and wash out subsurface reflections.
 
-        The direct wave itself is still drawn; it may appear saturated
-        (full white/black) which is the correct visual representation of
-        its much higher amplitude.
+        The direct wave and ringing are still drawn; they may appear saturated
+        (full white/black) which correctly represents their much higher amplitude.
 
         Returns (vmin, vmax) where vmin = -vmax.
         """
@@ -159,7 +158,6 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
         d_sub  = data[skip:, :] if n_rows > skip + 4 else data
         vabs   = float(np.percentile(np.abs(d_sub), pct))
         if vabs < 1e-10:
-            # Fallback: try the full data (e.g. very short profiles)
             vabs = float(np.percentile(np.abs(data), pct))
         if vabs < 1e-10:
             vabs = 1.0
@@ -252,12 +250,9 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
                 y_bottom = float(d_axis[-1])
                 y_label  = f'Depth  (0 – {y_bottom:.2f} m)'
 
-            # extent: [left, right, bottom, top]  (origin='upper')
             extent = [x_min, x_max, y_bottom, y_top]
 
             try:
-                # Symmetric clipping based on sub-surface amplitude only
-                # (direct-wave rows are excluded from the percentile calculation).
                 vmin, vmax = self._symmetric_clim(data)
 
                 LOG.debug(
