@@ -287,7 +287,7 @@ class OGPRViewerMainWindow(QMainWindow):
         layout.addWidget(self._grp_gain())
         layout.addWidget(self._grp_hilbert_norm())
         layout.addWidget(self._grp_migration())
-        layout.addWidget(self._grp_view())        # <-- view / trace range
+        layout.addWidget(self._grp_view())
         layout.addWidget(self._grp_display())
         layout.addWidget(self._grp_export())
         layout.addStretch()
@@ -388,14 +388,20 @@ class OGPRViewerMainWindow(QMainWindow):
     def _grp_gain(self):
         g = QGroupBox('Gain'); v = QVBoxLayout()
         self._cb(v, 'Enable', 'cb_gain')
-        self._combo(v, '  Type:', 'gain_type', ['sec', 'exp', 'linear', 'agc'])
+        self._combo(v, '  Type:', 'gain_type', ['agc', 'sec', 'exp', 'linear'])
         v.addWidget(QLabel(
             '<small><i>SEC = Spreading &amp; Exponential Compensation</i></small>'
         ))
-        self._dspin(v, '  Factor (exp/lin):',    'gain_factor', 0.1, 20.0, 2.0, 0.1)
-        self._dspin(v, '  \u03b1 (SEC) [1/ns]:',      'gain_alpha',  0.0,  5.0, 0.5, 0.05)
-        self._dspin(v, '  t-start [ns]:', 'gain_tstart', 0.0, 100.0, 0.0, 0.5, ' ns')
-        self._dspin(v, '  AGC window:',          'gain_agc_win',1.0, 500.0, 50.0, 5.0, ' ns')
+        # Factor: for SEC/exp/lin = max gain multiplier at t_max.
+        # Range 1-500 to cover from gentle (10x) to aggressive (500x) gains.
+        self._dspin(v, '  Factor (SEC/exp/lin):',
+                    'gain_factor', 1.0, 500.0, 20.0, 5.0)
+        v.addWidget(QLabel(
+            '<small><i>Factor = max gain multiplier at t_max</i></small>'
+        ))
+        self._dspin(v, '  \u03b1 (SEC) [1/ns]:', 'gain_alpha',  0.0, 5.0, 0.5, 0.05)
+        self._dspin(v, '  t-start [ns]:', 'gain_tstart', 0.0, 100.0, 5.0, 0.5, ' ns')
+        self._dspin(v, '  AGC window:',   'gain_agc_win', 1.0, 500.0, 25.0, 5.0, ' ns')
         g.setLayout(v); return g
 
     def _grp_hilbert_norm(self):
@@ -415,7 +421,7 @@ class OGPRViewerMainWindow(QMainWindow):
         g.setLayout(v); return g
 
     # ------------------------------------------------------------------
-    # View / trace-range group  (scroll long profiles)
+    # View / trace-range group
     # ------------------------------------------------------------------
 
     def _grp_view(self):
@@ -448,17 +454,16 @@ class OGPRViewerMainWindow(QMainWindow):
         v.addLayout(row2)
 
         v.addWidget(QLabel(
-            '<small><i>5000 trc ≈ 200 m  (at dx=0.04 m)</i></small>'
+            '<small><i>5000 trc \u2248 200 m  (at dx=0.04 m)</i></small>'
         ))
         g.setLayout(v); return g
 
     def _on_view_range_changed(self):
-        """Re-render only when view limiting is actually active."""
         if self.cb_limit_view.isChecked():
             self._apply_and_render()
 
     # ------------------------------------------------------------------
-    # Display group  (colormap + Y-axis + velocity)
+    # Display group
     # ------------------------------------------------------------------
 
     def _grp_display(self):
@@ -593,14 +598,12 @@ class OGPRViewerMainWindow(QMainWindow):
         )
         LOG.info(f"Swath added: {meta['swath_name']}")
 
-        # Update view range spinbox bounds to the largest loaded swath
         max_slices = max(
             e.data_dict['metadata']['slices_count']
             for e in self._swath_entries
         )
         self.view_start.setMaximum(max(0, max_slices - 1))
         self.view_width.setMaximum(max_slices)
-        # Default width: first 5000 traces (keeps the profile readable)
         if not self.cb_limit_view.isChecked():
             self.view_width.setValue(min(5000, max_slices))
 
@@ -666,7 +669,7 @@ class OGPRViewerMainWindow(QMainWindow):
     def _process_swath(self, entry: SwathSidebarEntry, p: dict):
         rv   = entry.data_dict['radar_volume']
         meta = entry.data_dict['metadata']
-        data = rv[:, entry.channel, :]  # (samples, slices)
+        data = rv[:, entry.channel, :]
 
         dt_ns = meta['sampling_time_ns']
         dx_m  = meta.get('sampling_step_m', 0.05)
@@ -735,7 +738,6 @@ class OGPRViewerMainWindow(QMainWindow):
                     f"{meta['dtype_name']}"
                 )
 
-                # Apply view window: slice to the requested trace range
                 if self.cb_limit_view.isChecked():
                     n_trc = data.shape[1]
                     vs    = max(0, min(self.view_start.value(), n_trc - 1))
@@ -930,7 +932,7 @@ class OGPRViewerMainWindow(QMainWindow):
     def _about(self):
         QMessageBox.about(
             self, 'About OGPR Radar Viewer',
-            '<h3>OGPR Radar Viewer v2.4</h3>'
+            '<h3>OGPR Radar Viewer v2.5</h3>'
             '<p>Processing based on:<br>'
             '<i>Goodman &amp; Piro (2013) \u2013 GPR Remote Sensing in Archaeology, Ch.3</i></p>'
         )

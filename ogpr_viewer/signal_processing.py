@@ -129,7 +129,6 @@ class SignalProcessor:
             elif shift < 0: out[: n_smp + shift, i] = data[-shift:,        i]
             else:           out[:, i] = data[:, i]
 
-        # Crop pre-trigger: remove samples 0..med-1 so profile starts at t=0
         if med > 0:
             out = out[med:, :]
 
@@ -145,10 +144,6 @@ class SignalProcessor:
     # ------------------------------------------------------------------
 
     def dewow(self, window_size: int = 50) -> np.ndarray:
-        """
-        Remove 'wow' (low-frequency DC drift) from each trace by
-        subtracting a moving average of length `window_size` samples.
-        """
         data = self.processed_data.copy()
         w    = max(3, int(window_size))
         kernel = np.ones(w, dtype=np.float32) / w
@@ -171,17 +166,6 @@ class SignalProcessor:
         rolling:       bool  = False,
         window_traces: int   = 50,
     ) -> np.ndarray:
-        """
-        Remove background horizontal banding (including the direct wave).
-
-        Global mode  (rolling=False):
-            Subtract the mean/median trace over ALL traces.
-            Effectively removes the direct wave and static antenna pattern.
-
-        Rolling mode (rolling=True):
-            Subtract a locally computed mean/median within a sliding window.
-            Better for non-stationary background.
-        """
         data = self.processed_data.copy()
         n_trc = data.shape[1]
         half  = window_traces // 2
@@ -216,9 +200,6 @@ class SignalProcessor:
         high_freq: float = 800.0,
         order:     int   = 4,
     ) -> np.ndarray:
-        """
-        Apply a zero-phase Butterworth bandpass filter along each trace.
-        """
         nyq  = self.sampling_freq_mhz / 2.0
         lo   = float(np.clip(low_freq  / nyq, 1e-4, 0.9999))
         hi   = float(np.clip(high_freq / nyq, 1e-4, 0.9999))
@@ -249,9 +230,6 @@ class SignalProcessor:
         bandwidth_mhz: float = 5.0,
         order:         int   = 2,
     ) -> np.ndarray:
-        """
-        Remove a single narrowband interference frequency.
-        """
         nyq   = self.sampling_freq_mhz / 2.0
         lo    = float(np.clip((freq_mhz - bandwidth_mhz / 2) / nyq, 1e-4, 0.9999))
         hi    = float(np.clip((freq_mhz + bandwidth_mhz / 2) / nyq, 1e-4, 0.9999))
@@ -282,9 +260,6 @@ class SignalProcessor:
         bp_high: Optional[float] = None,
         eps:     float = 1e-6,
     ) -> np.ndarray:
-        """
-        Spectral whitening: equalise amplitude across all frequencies.
-        """
         data   = self.processed_data.copy()
         n_smp  = data.shape[0]
         freqs  = np.fft.rfftfreq(n_smp, d=self.sampling_time_ns)
@@ -314,8 +289,8 @@ class SignalProcessor:
 
     def apply_gain(
         self,
-        gain_type:   Literal['exp', 'linear', 'sec', 'agc'] = 'sec',
-        factor:      float = 2.0,
+        gain_type:   Literal['exp', 'linear', 'sec', 'agc'] = 'agc',
+        factor:      float = 20.0,
         alpha:       float = 0.5,
         t_start_ns:  float = 5.0,
         window_ns:   float = 25.0,
@@ -329,26 +304,32 @@ class SignalProcessor:
         gain_type='linear'
             g(t) = 1 + factor * t/t_max
 
-        gain_type='sec'  <- recommended (Goodman & Piro 2013)
-            g(t) = t^2 * exp(alpha * t),  t >= t_start_ns
-            Compensates for geometric spreading and dielectric absorption.
+        gain_type='sec'  (Goodman & Piro 2013)
+            g(t) = 1 + (t^2 * exp(alpha*t) / max) * (factor - 1)
+            'factor' is the maximum gain multiplier at t=t_max.
+            e.g. factor=20  -> 1x at surface, 20x at bottom.
+            This fixes the previous bug where factor was ignored and
+            gain was hardcoded to 1e4.
 
         gain_type='agc'
-            Normalise each sample by the local RMS within a window of
-            window_ns nanoseconds.  The RMS is computed ONLY on the
-            sub-surface region (samples >= start_smp) so the direct wave
-            cannot bleed into the gain of deeper samples.
-            mode='reflect' avoids border artefacts at top and bottom.
+            Normalise each sample by the local RMS within window_ns.
+            - RMS is computed ONLY on samples >= start_smp (direct wave
+              region is excluded to prevent it inflating the RMS).
+            - A noise floor of 5% of the per-trace global RMS prevents
+              near-zero zones (e.g. after background removal) from being
+              amplified to saturation.
+            - mode='reflect' avoids border artefacts at trace ends.
 
         Args:
-            factor:     Multiplier for exp/linear gain.
-            alpha:      Absorption coefficient [1/ns] for SEC.
-            t_start_ns: Delay before AGC starts [ns].  Samples before this
-                        time keep their original amplitude (gain = 1.0).
-                        Typical value: 5 ns (skips direct wave).
-            window_ns:  AGC half-power window length [ns].  Should be
-                        2-3x the dominant wavelength; 25 ns is a safe
-                        default for 200-800 MHz antennas.
+            factor:     SEC/exp/lin: max gain multiplier at t=t_max.
+                        AGC: not used.
+            alpha:      SEC absorption coefficient [1/ns].
+            t_start_ns: Gain starts at this time [ns].
+                        For AGC: samples before t_start keep original values.
+                        Default 5 ns skips the direct wave.
+            window_ns:  AGC sliding window length [ns].
+                        Should be 2-3x the dominant wavelength.
+                        Default 25 ns suits 200-800 MHz antennas.
         """
         data  = self.processed_data.copy()
         n_smp = data.shape[0]
@@ -367,8 +348,17 @@ class SignalProcessor:
                 g = (t_shifted ** 2) * np.exp(alpha * t_shifted)
             g_max = float(g.max())
             if g_max > 0:
-                g = g / g_max * 1e4
-            g[t < t_start_ns] = 1.0
+                # 'factor' is the max gain multiplier at t=t_max.
+                # g ranges from 0 at t_start to factor at t_max.
+                # We add 1.0 so there is never a gain < 1 (no attenuation).
+                g = 1.0 + (g / g_max) * max(float(factor) - 1.0, 0.0)
+            else:
+                g = np.ones_like(t)
+            g[t < t_start_ns] = 1.0   # no change before t_start
+            LOG.debug(
+                f'SEC: factor={factor} (max_gain={factor}x at t_max)  '
+                f'alpha={alpha}  t_start={t_start_ns} ns'
+            )
 
         elif gain_type == 'agc':
             from scipy.ndimage import uniform_filter1d
@@ -376,39 +366,43 @@ class SignalProcessor:
             win_smp   = max(3, int(window_ns / self.sampling_time_ns))
             start_smp = max(0, int(t_start_ns / self.sampling_time_ns))
 
-            # Start from a copy so the pre-start region is preserved.
-            out = data.copy()
+            out = data.copy()   # pre-start rows kept as-is
 
-            # -------------------------------------------------------
-            # CRITICAL: compute RMS only on the sub-surface block
-            # [start_smp : n_smp].  This prevents the direct wave
-            # (strong signal in rows 0..start_smp-1) from leaking into
-            # the RMS of shallow subsurface samples through the filter
-            # window and compressing their amplitude to near-zero.
-            # -------------------------------------------------------
             if start_smp < n_smp:
-                sub = data[start_smp:, :]           # sub-surface block
+                sub = data[start_smp:, :].astype(np.float64)
 
-                # mode='reflect' mirrors the signal at both ends so
-                # there are no border artefacts (no value repetition
-                # that would create artificial high-RMS at the bottom).
-                rms = np.sqrt(
+                # Local RMS within the sliding window.
+                # mode='reflect' mirrors data at both ends:
+                #   - top border: avoids direct-wave bleed into sub block
+                #   - bottom border: avoids value-repetition artefact
+                local_rms = np.sqrt(
                     uniform_filter1d(
-                        sub.astype(np.float64) ** 2,
+                        sub ** 2,
                         size=win_smp,
                         axis=0,
                         mode='reflect',
                     )
                 )
-                rms = np.where(rms < 1e-10, 1e-10, rms)
-                out[start_smp:, :] = (sub / rms).astype(np.float32)
-            # Rows 0..start_smp-1 already equal data[:start_smp,:] from copy.
+
+                # Noise floor: per-trace global RMS of the sub-surface block.
+                # Prevents the AGC from amplifying dead zones (near-zero
+                # amplitude after background removal) to saturation.
+                # Floor = 5% of global RMS: regions quieter than this
+                # are not boosted beyond 20x their natural level.
+                global_rms = np.sqrt(
+                    np.mean(sub ** 2, axis=0, keepdims=True)
+                )
+                noise_floor = 0.05
+                rms_floor   = np.maximum(local_rms, global_rms * noise_floor)
+                rms_floor   = np.where(rms_floor < 1e-12, 1e-12, rms_floor)
+
+                out[start_smp:, :] = (sub / rms_floor).astype(np.float32)
 
             self.processed_data = out.astype(np.float32)
             LOG.debug(
                 f'AGC: window={window_ns} ns ({win_smp} smp)  '
-                f't_start={t_start_ns} ns (protected {start_smp} smp)  '
-                f'sub_block={n_smp - start_smp} smp'
+                f't_start={t_start_ns} ns ({start_smp} smp protected)  '
+                f'noise_floor=5%  sub_block={n_smp-start_smp} smp'
             )
             return self.processed_data
 
@@ -427,10 +421,6 @@ class SignalProcessor:
     # ------------------------------------------------------------------
 
     def apply_hilbert(self) -> np.ndarray:
-        """
-        Replace each trace with its instantaneous amplitude (envelope)
-        via the Hilbert transform.  (Goodman & Piro 2013, §3.6)
-        """
         data = self.processed_data.copy()
         for i in range(data.shape[1]):
             data[:, i] = np.abs(sp_signal.hilbert(data[:, i]))
@@ -446,13 +436,6 @@ class SignalProcessor:
         self,
         method: Literal['minmax', 'zscore', 'robust'] = 'minmax',
     ) -> np.ndarray:
-        """
-        Normalise data globally.
-
-        minmax : scale to [0, 1]
-        zscore : zero mean, unit variance
-        robust : scale between p5 and p95 percentiles, clip to [0, 1]
-        """
         data = self.processed_data.copy()
 
         if method == 'minmax':
@@ -483,10 +466,6 @@ class SignalProcessor:
         velocity_m_ns:   float = 0.10,
         aperture_traces: int   = 30,
     ) -> np.ndarray:
-        """
-        2-D diffraction-stack (Kirchhoff) migration.
-        (Goodman & Piro 2013, §3.5)
-        """
         data   = self.processed_data.copy()
         n_smp, n_trc = data.shape
         dt     = self.sampling_time_ns
@@ -533,12 +512,6 @@ class SignalProcessor:
     # ------------------------------------------------------------------
 
     def get_power_spectrum(self) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Compute the mean power spectrum of the current processed data.
-
-        Returns:
-            (frequencies_mhz, mean_power_db)
-        """
         data  = self.processed_data
         n_smp = data.shape[0]
         specs = np.abs(np.fft.rfft(data, axis=0)) ** 2
