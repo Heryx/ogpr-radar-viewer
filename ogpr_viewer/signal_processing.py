@@ -317,8 +317,8 @@ class SignalProcessor:
         gain_type:   Literal['exp', 'linear', 'sec', 'agc'] = 'sec',
         factor:      float = 2.0,
         alpha:       float = 0.5,
-        t_start_ns:  float = 0.0,
-        window_ns:   float = 50.0,
+        t_start_ns:  float = 5.0,
+        window_ns:   float = 25.0,
     ) -> np.ndarray:
         """
         Apply time-varying gain.
@@ -334,16 +334,21 @@ class SignalProcessor:
             Compensates for geometric spreading and dielectric absorption.
 
         gain_type='agc'
-            Normalise each sample by the local RMS within window_ns.
-            t_start_ns: samples before this time are NOT gain-corrected
-            (protects the direct wave / surface reflection).
+            Normalise each sample by the local RMS within a window of
+            window_ns nanoseconds.  The RMS is computed ONLY on the
+            sub-surface region (samples >= start_smp) so the direct wave
+            cannot bleed into the gain of deeper samples.
+            mode='reflect' avoids border artefacts at top and bottom.
 
         Args:
             factor:     Multiplier for exp/linear gain.
             alpha:      Absorption coefficient [1/ns] for SEC.
-            t_start_ns: Delay before gain starts [ns].
-                        For AGC: direct wave region is left unchanged.
-            window_ns:  AGC window length [ns].
+            t_start_ns: Delay before AGC starts [ns].  Samples before this
+                        time keep their original amplitude (gain = 1.0).
+                        Typical value: 5 ns (skips direct wave).
+            window_ns:  AGC half-power window length [ns].  Should be
+                        2-3x the dominant wavelength; 25 ns is a safe
+                        default for 200-800 MHz antennas.
         """
         data  = self.processed_data.copy()
         n_smp = data.shape[0]
@@ -367,24 +372,43 @@ class SignalProcessor:
 
         elif gain_type == 'agc':
             from scipy.ndimage import uniform_filter1d
+
             win_smp   = max(3, int(window_ns / self.sampling_time_ns))
             start_smp = max(0, int(t_start_ns / self.sampling_time_ns))
 
-            # Vectorised RMS across all traces simultaneously (axis=0)
-            rms = np.sqrt(
-                uniform_filter1d(data ** 2, size=win_smp, axis=0, mode='nearest')
-            )
-            rms = np.where(rms < 1e-10, 1e-10, rms)
-            out = (data / rms).astype(np.float32)
+            # Start from a copy so the pre-start region is preserved.
+            out = data.copy()
 
-            # Protect the direct wave / pre-start region: keep original values
-            if start_smp > 0:
-                out[:start_smp, :] = data[:start_smp, :].astype(np.float32)
+            # -------------------------------------------------------
+            # CRITICAL: compute RMS only on the sub-surface block
+            # [start_smp : n_smp].  This prevents the direct wave
+            # (strong signal in rows 0..start_smp-1) from leaking into
+            # the RMS of shallow subsurface samples through the filter
+            # window and compressing their amplitude to near-zero.
+            # -------------------------------------------------------
+            if start_smp < n_smp:
+                sub = data[start_smp:, :]           # sub-surface block
 
-            self.processed_data = out
+                # mode='reflect' mirrors the signal at both ends so
+                # there are no border artefacts (no value repetition
+                # that would create artificial high-RMS at the bottom).
+                rms = np.sqrt(
+                    uniform_filter1d(
+                        sub.astype(np.float64) ** 2,
+                        size=win_smp,
+                        axis=0,
+                        mode='reflect',
+                    )
+                )
+                rms = np.where(rms < 1e-10, 1e-10, rms)
+                out[start_smp:, :] = (sub / rms).astype(np.float32)
+            # Rows 0..start_smp-1 already equal data[:start_smp,:] from copy.
+
+            self.processed_data = out.astype(np.float32)
             LOG.debug(
                 f'AGC: window={window_ns} ns ({win_smp} smp)  '
-                f't_start={t_start_ns} ns (protected {start_smp} smp)'
+                f't_start={t_start_ns} ns (protected {start_smp} smp)  '
+                f'sub_block={n_smp - start_smp} smp'
             )
             return self.processed_data
 
