@@ -165,28 +165,96 @@ class SignalProcessor:
         method:        Literal['mean', 'median'] = 'mean',
         rolling:       bool  = False,
         window_traces: int   = 50,
+        sample_start:  Optional[int] = None,
+        sample_end:    Optional[int] = None,
     ) -> np.ndarray:
+        """
+        Subtract mean or median trace to remove horizontal banding.
+
+        Args:
+            method:        'mean' or 'median'
+            rolling:       If True, compute background from a sliding window
+                           of traces around each trace. If False, compute
+                           global background from all traces.
+            window_traces: Number of traces in rolling window (ignored if
+                           rolling=False).
+            sample_start:  Optional. If provided, compute mean/median only
+                           from samples >= sample_start. Useful to exclude
+                           the direct wave zone from background calculation.
+            sample_end:    Optional. If provided, compute mean/median only
+                           from samples < sample_end.
+
+        Returns:
+            Processed data with background removed.
+
+        Example:
+            # Exclude first 50 samples (direct wave) from background calc
+            processor.remove_background(
+                method='mean',
+                sample_start=50,
+                sample_end=500
+            )
+        """
         data = self.processed_data.copy()
+        n_smp = data.shape[0]
         n_trc = data.shape[1]
         half  = window_traces // 2
 
+        # Validate sample range
+        if sample_start is not None:
+            sample_start = max(0, int(sample_start))
+        else:
+            sample_start = 0
+
+        if sample_end is not None:
+            sample_end = min(n_smp, int(sample_end))
+        else:
+            sample_end = n_smp
+
+        if sample_start >= sample_end:
+            LOG.warning(
+                f'Background removal: invalid sample range '
+                f'[{sample_start}, {sample_end}) — using full range'
+            )
+            sample_start = 0
+            sample_end = n_smp
+
+        # Extract subset for background calculation
+        data_subset = data[sample_start:sample_end, :]
+
         if not rolling:
+            # Global background
             if method == 'mean':
-                bg = np.mean(data, axis=1, keepdims=True)
+                bg_subset = np.mean(data_subset, axis=1, keepdims=True)
             else:
-                bg = np.median(data, axis=1, keepdims=True)
+                bg_subset = np.median(data_subset, axis=1, keepdims=True)
+            
+            # Create full-size background array
+            bg = np.zeros((n_smp, 1), dtype=np.float32)
+            bg[sample_start:sample_end, :] = bg_subset
             data -= bg
         else:
+            # Rolling background
             out = data.copy()
             for i in range(n_trc):
                 lo  = max(0,     i - half)
                 hi  = min(n_trc, i + half)
-                win = data[:, lo:hi]
-                bg  = np.mean(win, axis=1) if method == 'mean' else np.median(win, axis=1)
-                out[:, i] = data[:, i] - bg
+                win_subset = data_subset[:, lo:hi]
+                
+                if method == 'mean':
+                    bg_subset = np.mean(win_subset, axis=1)
+                else:
+                    bg_subset = np.median(win_subset, axis=1)
+                
+                # Apply background only to the computed range
+                out[sample_start:sample_end, i] -= bg_subset
             data = out
 
-        LOG.debug(f'Background removal: method={method} rolling={rolling} win={window_traces}')
+        range_str = f'[{sample_start}:{sample_end}]' if (sample_start > 0 or sample_end < n_smp) else 'all'
+        LOG.debug(
+            f'Background removal: method={method} rolling={rolling} '
+            f'win={window_traces} sample_range={range_str}'
+        )
         self.processed_data = data
         return data
 
