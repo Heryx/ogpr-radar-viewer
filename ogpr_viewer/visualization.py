@@ -8,6 +8,8 @@ MultiPanelCanvas:
   - X axis: distance in metres (trace_spacing_m * n_traces)
   - Y axis: switchable  time (ns) | depth_rel (m) | depth_abs (m)
   - Dark theme
+  - Symmetric vmin/vmax centred at zero (98th percentile of |data|)
+    so that positive and negative GPR reflections are equally visible.
 """
 
 from __future__ import annotations
@@ -22,18 +24,21 @@ import numpy as np
 import matplotlib
 matplotlib.use('QtAgg')
 
-# Suppress the massive findfont DEBUG flood
 logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING)
 
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 
-from PyQt6.QtCore  import QTimer
+from PyQt6.QtCore    import QTimer
 from PyQt6.QtWidgets import QSizePolicy
 
 LOG = logging.getLogger('ogpr_viewer')
 
 YMode = Literal['time', 'depth_rel', 'depth_abs']
+
+# Percentile of |data| used for symmetric colour clipping.
+# 98 keeps the top 2% of spikes from compressing the colour scale.
+_CLIP_PCT = 98.0
 
 
 # ---------------------------------------------------------------------------
@@ -51,14 +56,13 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
         trace_spacing_m : float  [m] per trace  (0 = unknown -> show Trace #)
     """
 
-    # minimum pixel dimensions to avoid degenerate renders
     _MIN_W = 320
     _MIN_H = 220
 
     def __init__(self, parent=None, dpi: int = 96):
         self._dpi = dpi
         self.fig = Figure(
-            figsize=(8, 5),   # sensible default; will be overridden on first render
+            figsize=(8, 5),
             dpi=dpi,
             facecolor='#1e1e1e',
         )
@@ -71,7 +75,6 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
         self.setMinimumSize(self._MIN_W, self._MIN_H)
         self.updateGeometry()
 
-        # state for re-render on resize
         self._last_panels:   List[Dict] = []
         self._last_cmap:     str   = 'gray'
         self._last_y_mode:   YMode = 'time'
@@ -83,14 +86,12 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
         self._cbars:  list = []
 
     # ------------------------------------------------------------------
-    # Qt event overrides
+    # Qt overrides
     # ------------------------------------------------------------------
 
     def resizeEvent(self, event):
-        """Re-render when the widget is resized so the figure fills the new size."""
         super().resizeEvent(event)
         if self._last_panels:
-            # deferred so Qt finishes the resize first
             QTimer.singleShot(30, self._re_render)
 
     # ------------------------------------------------------------------
@@ -106,10 +107,6 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
         return rows, cols
 
     def _sync_fig_size(self):
-        """
-        Set the matplotlib Figure size to the current Qt widget pixel size.
-        forward=False prevents a Qt resize loop.
-        """
         w_px = max(self.width(),  self._MIN_W)
         h_px = max(self.height(), self._MIN_H)
         self.fig.set_size_inches(
@@ -121,7 +118,6 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
                   f'{w_px/self._dpi:.1f}x{h_px/self._dpi:.1f}in')
 
     def _re_render(self):
-        """Re-render with the stored last parameters (called after resize)."""
         if self._last_panels:
             self._render(
                 self._last_panels,
@@ -130,6 +126,22 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
                 self._last_vel,
                 self._last_t0,
             )
+
+    @staticmethod
+    def _symmetric_clim(data: np.ndarray, pct: float = _CLIP_PCT) -> Tuple[float, float]:
+        """
+        Compute a symmetric colour range centred at zero.
+
+        Uses the `pct`-th percentile of |data| so that the top (100-pct)%
+        of amplitude spikes do not compress the colour scale.  Both positive
+        and negative GPR reflections are rendered with equal contrast.
+
+        Returns (vmin, vmax) where vmin = -vmax.
+        """
+        vabs = float(np.percentile(np.abs(data), pct))
+        if vabs < 1e-10:
+            vabs = 1.0          # avoid degenerate all-zero panels
+        return -vabs, vabs
 
     # ------------------------------------------------------------------
     # Public API
@@ -147,9 +159,9 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
         Render panels and cache parameters for re-render on resize.
 
         y_mode options:
-          'time'      → Y axis in ns
-          'depth_rel' → Y axis depth from surface [m]  d = t*v/2
-          'depth_abs' → Y axis depth with t0 removed   d = (t-t0)*v/2
+          'time'      -> Y axis in ns
+          'depth_rel' -> Y axis depth from surface [m]  d = t*v/2
+          'depth_abs' -> Y axis depth with t0 removed   d = (t-t0)*v/2
         """
         self._last_panels = panels
         self._last_cmap   = cmap
@@ -171,10 +183,8 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
             f'y_mode={y_mode} v={velocity_m_ns} m/ns'
         )
 
-        # --- sync figure size to widget BEFORE clearing ---
         self._sync_fig_size()
 
-        # --- tear down previous render ---
         for cb in self._cbars:
             try: cb.remove()
             except Exception: pass
@@ -189,7 +199,6 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
 
         rows, cols = self._grid(len(panels))
 
-        # constrained_layout handles spacing automatically
         self.fig.set_constrained_layout(True)
         self.fig.set_constrained_layout_pads(
             w_pad=0.04, h_pad=0.06,
@@ -201,8 +210,8 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
             ax.set_facecolor('#111111')
             self._axes.append(ax)
 
-            data     = np.asarray(panel['data'],   dtype=np.float32)
-            t_axis   = np.asarray(
+            data   = np.asarray(panel['data'], dtype=np.float32)
+            t_axis = np.asarray(
                 panel.get('time_axis', np.arange(data.shape[0], dtype=np.float32)),
                 dtype=np.float32,
             )
@@ -229,20 +238,20 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
                 y_bottom = float(d_axis[-1])
                 y_label  = f'Depth  (0 – {y_bottom:.2f} m)'
 
-            # extent for imshow: [left, right, bottom, top]
-            # origin='upper' → row-0 at top → y_top is the top of the image
+            # extent: [left, right, bottom, top]  (origin='upper')
             extent = [x_min, x_max, y_bottom, y_top]
 
             try:
-                vmin = float(np.percentile(data, 2))
-                vmax = float(np.percentile(data, 98))
-                if vmax <= vmin:
-                    vmax = vmin + 1.0
+                # Symmetric colour limits centred at zero:
+                # the grey point of the colormap always represents zero amplitude.
+                # Positive reflections -> white/bright, negative -> dark, zero -> mid-grey.
+                vmin, vmax = self._symmetric_clim(data)
 
                 LOG.debug(
                     f'Panel {idx}: shape={data.shape}  '
                     f'extent={[round(v,3) for v in extent]}  '
-                    f'vmin={vmin:.3g}  vmax={vmax:.3g}'
+                    f'vmin={vmin:.3g}  vmax={vmax:.3g}  '
+                    f'(symmetric {_CLIP_PCT}th-pct clipping)'
                 )
 
                 im = ax.imshow(
@@ -281,7 +290,6 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
                     wrap=True,
                 )
 
-        # Use draw_idle (deferred) so Qt has finished its own layout pass
         self.draw_idle()
 
     # ------------------------------------------------------------------
@@ -298,7 +306,6 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
         self.draw_idle()
 
     def save_figure(self, filepath: str, dpi: int = 200):
-        # Sync to widget size before saving
         self._sync_fig_size()
         self.fig.savefig(
             filepath, dpi=dpi,
@@ -340,8 +347,12 @@ class RadarCanvas(FigureCanvasQTAgg):
 
         if time_axis  is None: time_axis  = np.arange(data.shape[0])
         if trace_axis is None: trace_axis = np.arange(data.shape[1])
-        if vmin is None: vmin = float(np.percentile(data, 2))
-        if vmax is None: vmax = float(np.percentile(data, 98))
+
+        # Symmetric clipping also for the legacy canvas
+        if vmin is None or vmax is None:
+            vabs = float(np.percentile(np.abs(data), _CLIP_PCT))
+            if vabs < 1e-10: vabs = 1.0
+            vmin, vmax = -vabs, vabs
 
         extent = [
             float(trace_axis[0]),  float(trace_axis[-1]),
