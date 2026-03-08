@@ -126,6 +126,9 @@ class SignalProcessor:
         
         for i in range(n_trc):
             shift = med - tz[i]
+            # Clamp shift to valid range to prevent out-of-bounds
+            shift = np.clip(shift, -n_smp + 1, n_smp - 1)
+            
             if shift > 0: 
                 # Shift down: pad top with edge value
                 out[shift:, i] = data[:n_smp - shift, i]
@@ -157,19 +160,19 @@ class SignalProcessor:
         kernel = np.ones(w, dtype=np.float32) / w
 
         for i in range(data.shape[1]):
-            # Use 'reflect' padding implicitly via numpy if we can,
-            # but convolve mode='same' pads with zeros.
-            # To fix edge artifacts in dewow, we should pad the trace before convolution
-            pad_w = w // 2
-            padded = np.pad(data[:, i], pad_w, mode='edge')
+            # Use symmetric padding to ensure output size matches input
+            # For even window: pad left more, for odd: symmetric
+            pad_left = w // 2
+            pad_right = w - pad_left - 1
+            
+            padded = np.pad(data[:, i], (pad_left, pad_right), mode='edge')
             ma = np.convolve(padded, kernel, mode='valid')
             
-            # Ensure sizes match (handling even/odd window sizes)
-            if len(ma) > len(data[:, i]):
-                ma = ma[:len(data[:, i])]
-            elif len(ma) < len(data[:, i]):
-                # Fallback to standard if size mismatch
+            # Trim to exact input size if needed
+            if len(ma) != len(data[:, i]):
+                # Fallback: use standard mode='same' with zero padding
                 ma = np.convolve(data[:, i], kernel, mode='same')
+                LOG.warning(f'Dewow: size mismatch, falling back to mode=same for trace {i}')
                 
             data[:, i] -= ma
 
@@ -329,13 +332,18 @@ class SignalProcessor:
         try:
             sos  = sp_signal.butter(order, [lo, hi], btype='band', output='sos')
             data = self.processed_data.copy()
+            n_smp = data.shape[0]
+            
             for i in range(data.shape[1]):
-                # Add edge padding to avoid ringing at start/end of traces
-                pad_len = 50
+                # Dynamic padding: max(50, 3*order) or 10% of trace length
+                pad_len = max(50, 3 * order, int(0.1 * n_smp))
+                pad_len = min(pad_len, n_smp // 2)  # Cap at 50% of trace length
+                
                 padded = np.pad(data[:, i], pad_len, mode='edge')
                 filtered = sp_signal.sosfiltfilt(sos, padded)
                 data[:, i] = filtered[pad_len:-pad_len]
-            LOG.debug(f'Bandpass: {low_freq}-{high_freq} MHz order={order}')
+                
+            LOG.debug(f'Bandpass: {low_freq}-{high_freq} MHz order={order} pad={pad_len}')
             self.processed_data = data
         except Exception as e:
             LOG.error(f'Bandpass error: {e}\n{traceback.format_exc()}')
@@ -363,9 +371,18 @@ class SignalProcessor:
         try:
             sos  = sp_signal.butter(order, [lo, hi], btype='bandstop', output='sos')
             data = self.processed_data.copy()
+            n_smp = data.shape[0]
+            
             for i in range(data.shape[1]):
-                data[:, i] = sp_signal.sosfiltfilt(sos, data[:, i])
-            LOG.debug(f'Notch: {freq_mhz} ± {bandwidth_mhz/2} MHz')
+                # Add edge padding like bandpass for consistency
+                pad_len = max(50, 3 * order, int(0.1 * n_smp))
+                pad_len = min(pad_len, n_smp // 2)
+                
+                padded = np.pad(data[:, i], pad_len, mode='edge')
+                filtered = sp_signal.sosfiltfilt(sos, padded)
+                data[:, i] = filtered[pad_len:-pad_len]
+                
+            LOG.debug(f'Notch: {freq_mhz} ± {bandwidth_mhz/2} MHz order={order} pad={pad_len}')
             self.processed_data = data
         except Exception as e:
             LOG.error(f'Notch error: {e}\n{traceback.format_exc()}')
@@ -380,8 +397,16 @@ class SignalProcessor:
         self,
         bp_low:  Optional[float] = None,
         bp_high: Optional[float] = None,
-        eps:     float = 1e-6,
+        eps:     float = 1e-10,
     ) -> np.ndarray:
+        """
+        Apply spectral whitening to balance frequency amplitudes.
+        
+        Args:
+            bp_low:  Low frequency cutoff [MHz]
+            bp_high: High frequency cutoff [MHz]
+            eps:     Regularization to prevent division by zero (absolute value)
+        """
         data   = self.processed_data.copy()
         n_smp  = data.shape[0]
         freqs  = np.fft.rfftfreq(n_smp, d=self.sampling_time_ns)
@@ -397,11 +422,12 @@ class SignalProcessor:
         for i in range(data.shape[1]):
             spec = np.fft.rfft(data[:, i])
             mag  = np.abs(spec)
-            spec_white = spec / (mag + eps * mag.max())
+            # Use absolute epsilon instead of relative to prevent explosive values
+            spec_white = spec / (mag + eps)
             spec_white *= mask
             data[:, i] = np.fft.irfft(spec_white, n=n_smp).astype(np.float32)
 
-        LOG.debug(f'Spectral whitening: bp=[{bp_low},{bp_high}] MHz')
+        LOG.debug(f'Spectral whitening: bp=[{bp_low},{bp_high}] MHz eps={eps}')
         self.processed_data = data
         return data
 
@@ -416,6 +442,7 @@ class SignalProcessor:
         alpha:       float = 0.5,
         t_start_ns:  float = 5.0,
         window_ns:   float = 25.0,
+        noise_floor: float = 0.01,
     ) -> np.ndarray:
         """
         Apply time-varying gain.
@@ -441,15 +468,18 @@ class SignalProcessor:
             - mode='reflect' avoids border artefacts at trace ends.
 
         Args:
-            factor:     SEC/exp/lin: max gain multiplier at t=t_max.
-                        AGC: not used.
-            alpha:      SEC absorption coefficient [1/ns].
-            t_start_ns: Gain starts at this time [ns].
-                        For AGC: samples before t_start keep original values.
-                        Default 5 ns skips the direct wave.
-            window_ns:  AGC sliding window length [ns].
-                        Should be 2-3x the dominant wavelength.
-                        Default 25 ns suits 200-800 MHz antennas.
+            factor:      SEC/exp/lin: max gain multiplier at t=t_max.
+                         AGC: not used.
+            alpha:       SEC absorption coefficient [1/ns].
+            t_start_ns:  Gain starts at this time [ns].
+                         For AGC: samples before t_start keep original values.
+                         Default 5 ns skips the direct wave.
+            window_ns:   AGC sliding window length [ns].
+                         Should be 2-3x the dominant wavelength.
+                         Default 25 ns suits 200-800 MHz antennas.
+            noise_floor: AGC noise floor as fraction of deep global RMS.
+                         Default 0.01 (1%). Lower values = more aggressive,
+                         higher values = more conservative.
         """
         data  = self.processed_data.copy()
         n_smp = data.shape[0]
@@ -516,9 +546,8 @@ class SignalProcessor:
                 global_rms = np.sqrt(
                     np.mean(deep_half ** 2, axis=0, keepdims=True)
                 )
-                noise_floor = 0.05
-                rms_floor   = np.maximum(local_rms, global_rms * noise_floor)
-                rms_floor   = np.where(rms_floor < 1e-12, 1e-12, rms_floor)
+                rms_floor = np.maximum(local_rms, global_rms * noise_floor)
+                rms_floor = np.where(rms_floor < 1e-12, 1e-12, rms_floor)
 
                 out[start_smp:, :] = (sub / rms_floor).astype(np.float32)
 
@@ -526,7 +555,8 @@ class SignalProcessor:
             LOG.debug(
                 f'AGC: window={window_ns} ns ({win_smp} smp)  '
                 f't_start={t_start_ns} ns ({start_smp} smp protected)  '
-                f'noise_floor=5% of deep-half global RMS  sub_block={n_smp-start_smp} smp'
+                f'noise_floor={noise_floor*100:.1f}% of deep-half global RMS  '
+                f'sub_block={n_smp-start_smp} smp'
             )
             return self.processed_data
 
