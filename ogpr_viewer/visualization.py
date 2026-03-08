@@ -613,7 +613,13 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
             extent = [x_min, x_max, y_bottom, y_top]
 
             try:
-                vmin, vmax = self._symmetric_clim(data)
+                dplot = np.asarray(data, dtype=np.float32)
+                if not np.isfinite(dplot).all():
+                    dplot = np.nan_to_num(
+                        dplot, nan=0.0, posinf=0.0, neginf=0.0
+                    ).astype(np.float32)
+
+                vmin, vmax = self._symmetric_clim(dplot)
 
                 LOG.debug(
                     f'Panel {idx}: shape={data.shape}  '
@@ -626,7 +632,12 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
                 if nm == 'symlog':
                     vabs = max(abs(vmin), abs(vmax))
                     lin_pct = float(np.clip(symlog_linthresh_pct, 0.1, 50.0))
-                    linth = max(vabs * (lin_pct / 100.0), 1e-8)
+                    # Robust linear threshold: keep at least median absolute
+                    # amplitude so weak reflectors are not over-compressed.
+                    abs_med = float(np.nanmedian(np.abs(dplot)))
+                    if not np.isfinite(abs_med):
+                        abs_med = 0.0
+                    linth = max(vabs * (lin_pct / 100.0), abs_med, 1e-8)
                     norm = SymLogNorm(
                         linthresh=linth,
                         linscale=1.0,
@@ -635,7 +646,7 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
                         base=10.0,
                     )
                     im = ax.imshow(
-                        data,
+                        dplot,
                         cmap=cmap,
                         aspect='auto',
                         extent=extent,
@@ -645,7 +656,7 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
                     )
                 else:
                     im = ax.imshow(
-                        data,
+                        dplot,
                         cmap=cmap,
                         aspect='auto',
                         extent=extent,
@@ -676,7 +687,7 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
                 if self._wiggle_overlay:
                     self._draw_wiggles(
                         ax=ax,
-                        data=data,
+                        data=dplot,
                         dx=dx,
                         y_top=y_top,
                         y_bottom=y_bottom,

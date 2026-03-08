@@ -36,7 +36,6 @@ from typing import Literal, Optional, Tuple
 
 import numpy as np
 from scipy import signal as sp_signal
-from scipy.ndimage import gaussian_filter1d, uniform_filter1d
 
 LOG = logging.getLogger('ogpr_viewer')
 
@@ -375,23 +374,17 @@ class SignalProcessor:
 
     def _as_f32(self) -> np.ndarray:
         """Working float32 copy of processed_data (for spectral / float ops)."""
-        arr = self.processed_data.astype(np.float32, copy=True)
-        if not np.isfinite(arr).all():
-            arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-        return arr
+        return self.processed_data.astype(np.float32, copy=True)
 
     def _store(self, result: np.ndarray):
         """Store result back into processed_data, preserving native dtype."""
-        arr = np.asarray(result)
-        if not np.isfinite(arr).all():
-            arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
         if self._is_int16:
             # Clip to int16 range to avoid overflow
             self.processed_data = np.clip(
-                np.round(arr), -32768, 32767
+                np.round(result), -32768, 32767
             ).astype(np.int16)
         else:
-            self.processed_data = np.array(arr, dtype=np.float32)
+            self.processed_data = np.array(result, dtype=np.float32)
 
     # ------------------------------------------------------------------
     # 1. Time-Zero Correction
@@ -620,14 +613,11 @@ class SignalProcessor:
         data = self._as_f32()
         n    = data.shape[0]
         w    = min(window_size, n)
-        if w < 1:
-            return self.processed_data
-        if w % 2 == 0:
-            w += 1
-        # Reflect padding (via uniform_filter1d mode='reflect') avoids edge
-        # transients that appear with zero-padding at trace ends.
-        trend = uniform_filter1d(data, size=w, axis=0, mode='reflect')
-        out = data - trend
+        kernel = np.ones(w, dtype=np.float32) / w
+        out  = np.empty_like(data)
+        for i in range(data.shape[1]):
+            trend   = np.convolve(data[:, i], kernel, mode='same')
+            out[:, i] = data[:, i] - trend
         LOG.debug(f'Dewow: window={w}')
         self._store(out)
         return self.processed_data
@@ -649,49 +639,6 @@ class SignalProcessor:
         data[:mute_smp, :] = 0.0
         LOG.debug(f'Top mute: mute_ns={mute_ns:.2f} -> mute_smp={mute_smp}')
         self._store(data)
-        return self.processed_data
-
-    def apply_spatial_stacking(
-        self,
-        window_traces: int = 5,
-        decimation: int = 1,
-    ) -> np.ndarray:
-        """
-        Spatial smoothing/stacking along trace axis.
-
-        Args:
-            window_traces: moving-average window in traces (>=1)
-            decimation: keep one trace every N after smoothing (>=1)
-        """
-        data = self._as_f32()
-        n_smp, n_trc = data.shape
-        w = max(1, int(window_traces))
-        d = max(1, int(decimation))
-        if (w <= 1) and (d <= 1):
-            return self.processed_data
-
-        out = data
-        if w > 1 and n_trc > 1:
-            if w % 2 == 0:
-                w += 1
-            pad = w // 2
-            padded = np.pad(out, ((0, 0), (pad, pad)), mode='edge')
-            cs = np.cumsum(padded, axis=1, dtype=np.float64)
-            cs = np.concatenate(
-                [np.zeros((n_smp, 1), dtype=np.float64), cs],
-                axis=1,
-            )
-            out = ((cs[:, w:] - cs[:, :-w]) / float(w)).astype(np.float32)
-
-        if d > 1 and out.shape[1] > 1:
-            out = out[:, ::d]
-            self.trace_spacing_m = float(self.trace_spacing_m) * float(d)
-
-        LOG.debug(
-            f'Spatial stacking: window={w} decimation={d} '
-            f'shape={data.shape}->{out.shape} dx={self.trace_spacing_m:.6f} m'
-        )
-        self._store(out)
         return self.processed_data
 
     def apply_static_correction(
@@ -1029,21 +976,17 @@ class SignalProcessor:
             gate_smp = min(gate_smp, n_smp)
             out = np.empty_like(data)
             cap = max(1.0, float(factor))
-            sigma = max(0.5, float(win) / 3.0)
             for i in range(data.shape[1]):
                 tr    = data[:, i]
-                sq = np.square(tr, dtype=np.float32)
-                rms = np.sqrt(gaussian_filter1d(sq, sigma=sigma, axis=0, mode='reflect'))
-                eps = max(float(np.nanmax(rms)) * 1e-6, 1e-12)
-                rms = np.where(rms > eps, rms, eps)
+                env = np.convolve(np.abs(tr), np.ones(win) / win, mode='same')
+                # Noise floor from deep half avoids direct-wave dominance.
+                deep_start = n_smp // 2
+                noise = float(np.median(np.abs(tr[deep_start:]))) + 1e-10
+                env = np.where(env < noise, noise, env)
 
-                # Robust reference from post-gate samples.
-                rseg = rms[gate_smp:] if gate_smp < n_smp else rms
-                rref = float(np.nanmedian(rseg)) if rseg.size else float(np.nanmedian(rms))
-                if not np.isfinite(rref) or rref <= 0:
-                    rref = float(np.nanpercentile(rms, 70)) if np.isfinite(np.nanpercentile(rms, 70)) else 1.0
-
-                g = rref / rms
+                # Normalize AGC around unit median gain and clamp amplification.
+                env_ref = float(np.median(env)) + 1e-10
+                g = env_ref / env
                 g = np.clip(g, 1.0 / cap, cap)
                 if gate_smp > 0:
                     # Do not amplify the direct-wave zone.

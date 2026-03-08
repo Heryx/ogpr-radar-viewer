@@ -22,6 +22,7 @@ import traceback
 import json
 import zipfile
 import tempfile
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing  import Any, Dict, List, Optional, Tuple
@@ -34,7 +35,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QComboBox, QFileDialog,
     QGroupBox, QSpinBox, QDoubleSpinBox, QCheckBox,
     QMessageBox, QStatusBar, QScrollArea, QSizePolicy,
-    QSplitter, QFrame, QDialog, QButtonGroup, QRadioButton,
+    QSplitter, QFrame, QDialog, QButtonGroup, QRadioButton, QInputDialog,
 )
 from PyQt6.QtCore import Qt, QSettings, QThread, pyqtSignal
 from PyQt6.QtGui  import QAction, QKeySequence, QFont
@@ -69,6 +70,60 @@ def _setup_logger() -> logging.Logger:
 LOG = _setup_logger()
 logging.getLogger('matplotlib').setLevel(logging.WARNING)
 logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING)
+
+
+PROJECT_STAGE_DIRS = [
+    'raw',
+    '00_stack',
+    '01_time0',
+    '02_dewow',
+    '03_background',
+    '04_bandpass',
+    '05_gain',
+]
+
+
+def _sanitize_project_name(name: str) -> str:
+    clean = ''.join(ch if (ch.isalnum() or ch in '-_') else '_' for ch in str(name).strip())
+    clean = clean.strip('_')
+    return clean or datetime.now().strftime('project_%Y%m%d_%H%M%S')
+
+
+def _read_json(path: Path, default: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        return json.loads(path.read_text(encoding='utf-8'))
+    except Exception:
+        return dict(default)
+
+
+def _write_json(path: Path, payload: Dict[str, Any]):
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding='utf-8',
+    )
+
+
+def _create_project_structure(root_dir: str, project_name: str) -> Path:
+    root = Path(root_dir)
+    if not root.exists():
+        raise FileNotFoundError(f'Root directory not found: {root}')
+
+    clean_name = _sanitize_project_name(project_name)
+    project_path = root / f'Project_{clean_name}'
+    project_path.mkdir(parents=True, exist_ok=True)
+    for folder in PROJECT_STAGE_DIRS:
+        (project_path / folder).mkdir(parents=True, exist_ok=True)
+
+    meta_path = project_path / 'metadata.json'
+    if not meta_path.exists():
+        _write_json(meta_path, {
+            'project_name': clean_name,
+            'created_at': datetime.now().isoformat(),
+            'acquisition_params': {},
+            'processing_log': [],
+            'stage_dirs': PROJECT_STAGE_DIRS,
+        })
+    return project_path
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +213,108 @@ def _extract_trace_elevations(
     return z.astype(np.float64, copy=False)
 
 
+def _safe_tz_threshold(requested: float) -> float:
+    thr = float(requested)
+    if not np.isfinite(thr):
+        return 0.08
+    thr = float(np.clip(thr, 0.02, 0.50))
+    if thr > 0.10:
+        LOG.warning(
+            f'Time-zero threshold {requested:.3f} too high for first-break picking; '
+            'using 0.10'
+        )
+        thr = 0.10
+    return thr
+
+
+def _safe_dewow_window_samples(
+    requested_samples: int,
+    dt_ns: float,
+    center_freq_mhz: float,
+) -> int:
+    req = max(1, int(requested_samples))
+    dt = max(float(dt_ns), 1e-9)
+    f0 = float(center_freq_mhz) if np.isfinite(center_freq_mhz) else 0.0
+
+    # Physically safe minimum:
+    #  - at least 2.5 ns
+    #  - and at least 1.5 periods of center frequency when known.
+    min_ns = 2.5
+    if f0 > 0.0:
+        period_ns = 1000.0 / f0
+        min_ns = max(min_ns, 1.5 * period_ns)
+    min_smp = max(3, int(np.ceil(min_ns / dt)))
+
+    if req < min_smp:
+        LOG.warning(
+            f'Dewow window too short ({req} smp, dt={dt_ns:.3f} ns, f0={f0:.1f} MHz). '
+            f'Using safe minimum {min_smp} smp (~{min_smp * dt_ns:.2f} ns).'
+        )
+        return min_smp
+    return req
+
+
+def _resolve_stack_params(params: Dict[str, Any]) -> Tuple[int, int]:
+    w = max(1, int(params.get('stack_win_trc', 5)))
+    d = max(1, int(params.get('stack_decim', 1)))
+    auto_decim = bool(params.get('stack_auto_decim', True))
+    if auto_decim and (w > 1) and (d <= 1):
+        d = w
+        LOG.debug(f'Stack auto-decimation: decimation set to window ({w})')
+    return w, d
+
+
+def _safe_background_params(
+    requested_method: str,
+    rolling: bool,
+    requested_win_trc: int,
+    dx_m: float,
+) -> Tuple[str, int]:
+    method = str(requested_method).lower().strip()
+    win = max(5, int(requested_win_trc))
+    dx = max(float(dx_m), 1e-9)
+
+    if not rolling:
+        return method, win
+
+    span_m = win * dx
+    max_span_m = 4.0
+    if span_m > max_span_m:
+        win_max = max(5, int(np.floor(max_span_m / dx)))
+        if win > win_max:
+            LOG.warning(
+                f'Background rolling window too wide ({span_m:.2f} m). '
+                f'Using {win_max} traces (~{win_max * dx:.2f} m).'
+            )
+            win = win_max
+            span_m = win * dx
+
+    if method == 'mean' and span_m >= 3.0:
+        LOG.warning(
+            f'Background method "mean" on wide rolling span ({span_m:.2f} m) may cause shadowing. '
+            'Using "median".'
+        )
+        method = 'median'
+
+    return method, win
+
+
+def _safe_migration_aperture_traces(requested_ap: int, dx_m: float) -> int:
+    ap = max(3, int(requested_ap))
+    dx = max(float(dx_m), 1e-9)
+    span_m = ap * dx
+    max_span_m = 3.0
+    if span_m > max_span_m:
+        ap_max = max(5, int(np.floor(max_span_m / dx)))
+        if ap > ap_max:
+            LOG.warning(
+                f'Migration aperture too wide ({span_m:.2f} m). '
+                f'Using {ap_max} traces (~{ap_max * dx:.2f} m).'
+            )
+            ap = ap_max
+    return ap
+
+
 def _process_matrix_with_pipeline(
     data: np.ndarray,
     meta: Dict[str, Any],
@@ -167,6 +324,16 @@ def _process_matrix_with_pipeline(
 ) -> Tuple[np.ndarray, np.ndarray, float]:
     dt_ns = float(meta['sampling_time_ns'])
     dx_m = float(meta.get('sampling_step_m', 0.05))
+    f0_mhz = float(meta.get('frequency_mhz', 0.0) or 0.0)
+    tz_thr = _safe_tz_threshold(float(p.get('tz_thresh', 0.1)))
+    tz_mode = str(p.get('tz_mode', 'line')).lower().strip()
+    if tz_mode not in ('scan', 'line'):
+        tz_mode = 'line'
+    dewow_win = _safe_dewow_window_samples(
+        requested_samples=int(p.get('dewow_win', 50)),
+        dt_ns=dt_ns,
+        center_freq_mhz=f0_mhz,
+    )
 
     proc = SignalProcessor(
         data,
@@ -174,24 +341,40 @@ def _process_matrix_with_pipeline(
         trace_spacing_m=dx_m,
     )
 
+    if p.get('stack', False):
+        stack_w, stack_d = _resolve_stack_params(p)
+        proc.apply_spatial_stacking(
+            window_traces=stack_w,
+            decimation=stack_d,
+        )
+
+    # Per high-density or decimated geometry, line-wise time-zero is more
+    # stable and preserves micro-topography better than per-trace scan mode.
+    if tz_mode == 'scan' and float(proc.trace_spacing_m) >= 0.10:
+        LOG.warning(
+            f'Time-zero scan mode with dx={proc.trace_spacing_m:.3f} m can induce jitter. '
+            'Using line mode.'
+        )
+        tz_mode = 'line'
+
     if p.get('dewow_first', False):
         if p.get('dewow', False):
-            proc.dewow(window_size=int(p.get('dewow_win', 50)))
+            proc.dewow(window_size=dewow_win)
         if p.get('t0', False):
             proc.correct_time_zero(
                 method=str(p.get('tz_method', 'threshold')),
-                threshold=float(p.get('tz_thresh', 0.1)),
-                offset_mode=str(p.get('tz_mode', 'scan')),
+                threshold=tz_thr,
+                offset_mode=tz_mode,
             )
     else:
         if p.get('t0', False):
             proc.correct_time_zero(
                 method=str(p.get('tz_method', 'threshold')),
-                threshold=float(p.get('tz_thresh', 0.1)),
-                offset_mode=str(p.get('tz_mode', 'scan')),
+                threshold=tz_thr,
+                offset_mode=tz_mode,
             )
         if p.get('dewow', False):
-            proc.dewow(window_size=int(p.get('dewow_win', 50)))
+            proc.dewow(window_size=dewow_win)
 
     if float(p.get('top_mute_ns', 0.0)) > 0.0:
         proc.apply_top_mute(mute_ns=float(p.get('top_mute_ns', 0.0)))
@@ -213,16 +396,37 @@ def _process_matrix_with_pipeline(
             LOG.debug('Static correction: no usable elevation vector for this swath')
 
     if p.get('bg', False):
-        proc.remove_background(
-            method=str(p.get('bg_method', 'mean')),
+        bg_method, bg_win = _safe_background_params(
+            requested_method=str(p.get('bg_method', 'mean')),
             rolling=bool(p.get('bg_rolling', False)),
-            window_traces=int(p.get('bg_win_trc', 50)),
+            requested_win_trc=int(p.get('bg_win_trc', 50)),
+            dx_m=float(proc.trace_spacing_m),
+        )
+        proc.remove_background(
+            method=bg_method,
+            rolling=bool(p.get('bg_rolling', False)),
+            window_traces=bg_win,
             trim_percent=float(p.get('bg_trim_pct', 10.0)),
         )
     if p.get('bp', False):
+        bp_low = float(p.get('bp_low', 100.0))
+        bp_high = float(p.get('bp_high', 800.0))
+        if p.get('bp_auto', False):
+            f0 = float(meta.get('frequency_mhz', 0.0) or 0.0)
+            nyq = 0.5 * (1000.0 / max(dt_ns, 1e-9))
+            if f0 >= 500.0:
+                bp_low = 200.0
+                bp_high = min(600.0, 0.95 * nyq)
+            elif f0 > 0.0:
+                bp_low = max(20.0, 0.33 * f0)
+                bp_high = min(0.95 * nyq, 1.20 * f0)
+            LOG.debug(
+                f'Bandpass auto-tune from metadata: f0={f0:.1f} MHz '
+                f'-> {bp_low:.1f}-{bp_high:.1f} MHz'
+            )
         proc.apply_bandpass(
-            low_freq=float(p.get('bp_low', 100.0)),
-            high_freq=float(p.get('bp_high', 800.0)),
+            low_freq=bp_low,
+            high_freq=bp_high,
             order=int(p.get('bp_order', 4)),
             mode=str(p.get('bp_mode', 'gpr')),
         )
@@ -250,12 +454,16 @@ def _process_matrix_with_pipeline(
     if p.get('norm', False):
         proc.normalize(method=str(p.get('norm_method', 'minmax')))
     if p.get('mig', False):
+        ap = _safe_migration_aperture_traces(
+            requested_ap=int(p.get('mig_ap', 30)),
+            dx_m=float(proc.trace_spacing_m),
+        )
         proc.apply_migration(
             velocity_m_ns=float(p.get('mig_vel', p.get('velocity', 0.10))),
-            aperture_traces=int(p.get('mig_ap', 30)),
+            aperture_traces=ap,
         )
 
-    return proc.get_processed_data(), proc.get_time_axis(), dx_m
+    return proc.get_processed_data(), proc.get_time_axis(), float(proc.trace_spacing_m)
 
 
 class ProcessingThread(QThread):
@@ -315,7 +523,7 @@ class ProcessingThread(QThread):
                     max_display_traces = int(max(200, p.get('max_display_traces', 2500)))
                     n_trc_total = int(proc_data.shape[1])
                     if n_trc_total > max_display_traces:
-                        step_dec = max(1, n_trc_total // max_display_traces)
+                        step_dec = max(1, int(np.ceil(n_trc_total / max_display_traces)))
                         proc_data = proc_data[:, ::step_dec]
                         dx_m = float(dx_m) * float(step_dec)
                         LOG.debug(
@@ -343,6 +551,280 @@ class ProcessingThread(QThread):
             self.finished.emit(self.request_id, panels)
         except Exception as e:
             self.error.emit(self.request_id, str(e))
+
+
+def _build_batch_stage_plan(params: Dict[str, Any]) -> List[Dict[str, Any]]:
+    stages: List[Dict[str, Any]] = []
+
+    if bool(params.get('stack', False)):
+        stages.append({
+            'name': 'stack',
+            'folder': '00_stack',
+        })
+
+    dewow_enabled = bool(params.get('dewow', False))
+    dewow_first = bool(params.get('dewow_first', False))
+    has_time0_stage = bool(params.get('t0', False))
+    has_time0_stage = has_time0_stage or (float(params.get('top_mute_ns', 0.0)) > 0.0)
+    has_time0_stage = has_time0_stage or bool(params.get('static_corr', False))
+
+    if dewow_enabled and dewow_first:
+        stages.append({
+            'name': 'dewow',
+            'folder': '02_dewow',
+        })
+    if has_time0_stage:
+        stages.append({
+            'name': 'time0',
+            'folder': '01_time0',
+        })
+    if dewow_enabled and (not dewow_first):
+        stages.append({
+            'name': 'dewow',
+            'folder': '02_dewow',
+        })
+    if bool(params.get('bg', False)):
+        stages.append({
+            'name': 'background',
+            'folder': '03_background',
+        })
+    if bool(params.get('bp', False)):
+        stages.append({
+            'name': 'bandpass',
+            'folder': '04_bandpass',
+        })
+    if bool(params.get('gain', False)):
+        stages.append({
+            'name': 'gain',
+            'folder': '05_gain',
+        })
+
+    return stages
+
+
+class BatchProcessingThread(QThread):
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, project_path: str, pipeline_params: Dict[str, Any]):
+        super().__init__()
+        self.project_path = Path(project_path)
+        self.pipeline_params = dict(pipeline_params)
+
+    def _apply_stage(
+        self,
+        stage_name: str,
+        proc: SignalProcessor,
+        meta: Dict[str, Any],
+        geolocations: Optional[np.ndarray],
+        channel: int,
+    ):
+        p = self.pipeline_params
+        dt_ns = float(meta.get('sampling_time_ns', proc.sampling_time_ns))
+        f0_mhz = float(meta.get('frequency_mhz', 0.0) or 0.0)
+
+        if stage_name == 'stack':
+            stack_w, stack_d = _resolve_stack_params(p)
+            proc.apply_spatial_stacking(
+                window_traces=stack_w,
+                decimation=stack_d,
+            )
+            return
+
+        if stage_name == 'time0':
+            if p.get('t0', False):
+                tz_thr = _safe_tz_threshold(float(p.get('tz_thresh', 0.1)))
+                tz_mode = str(p.get('tz_mode', 'line')).lower().strip()
+                if tz_mode not in ('scan', 'line'):
+                    tz_mode = 'line'
+                if tz_mode == 'scan' and float(proc.trace_spacing_m) >= 0.10:
+                    LOG.warning(
+                        f'Batch time-zero scan mode with dx={proc.trace_spacing_m:.3f} m '
+                        'can induce jitter. Using line mode.'
+                    )
+                    tz_mode = 'line'
+                proc.correct_time_zero(
+                    method=str(p.get('tz_method', 'threshold')),
+                    threshold=tz_thr,
+                    offset_mode=tz_mode,
+                )
+            if float(p.get('top_mute_ns', 0.0)) > 0.0:
+                proc.apply_top_mute(float(p.get('top_mute_ns', 0.0)))
+            if p.get('static_corr', False):
+                elev = _extract_trace_elevations(
+                    geolocations=geolocations,
+                    channel=channel,
+                    n_trc=int(proc.processed_data.shape[1]),
+                )
+                if elev is not None:
+                    proc.apply_static_correction(
+                        elevations_m=elev,
+                        velocity_m_ns=float(p.get('velocity', 0.10)),
+                        reference=str(p.get('static_ref', 'max')),
+                        two_way=bool(p.get('static_two_way', False)),
+                    )
+            return
+
+        if stage_name == 'dewow':
+            dewow_win = _safe_dewow_window_samples(
+                requested_samples=int(p.get('dewow_win', 50)),
+                dt_ns=dt_ns,
+                center_freq_mhz=f0_mhz,
+            )
+            proc.dewow(window_size=dewow_win)
+            return
+
+        if stage_name == 'background':
+            bg_method, bg_win = _safe_background_params(
+                requested_method=str(p.get('bg_method', 'mean')),
+                rolling=bool(p.get('bg_rolling', False)),
+                requested_win_trc=int(p.get('bg_win_trc', 50)),
+                dx_m=float(proc.trace_spacing_m),
+            )
+            proc.remove_background(
+                method=bg_method,
+                rolling=bool(p.get('bg_rolling', False)),
+                window_traces=bg_win,
+                trim_percent=float(p.get('bg_trim_pct', 10.0)),
+            )
+            return
+
+        if stage_name == 'bandpass':
+            bp_low = float(p.get('bp_low', 100.0))
+            bp_high = float(p.get('bp_high', 800.0))
+            if p.get('bp_auto', False):
+                f0 = float(meta.get('frequency_mhz', 0.0) or 0.0)
+                nyq = 0.5 * (1000.0 / max(dt_ns, 1e-9))
+                if f0 >= 500.0:
+                    bp_low = 200.0
+                    bp_high = min(600.0, 0.95 * nyq)
+                elif f0 > 0.0:
+                    bp_low = max(20.0, 0.33 * f0)
+                    bp_high = min(0.95 * nyq, 1.20 * f0)
+            proc.apply_bandpass(
+                low_freq=bp_low,
+                high_freq=bp_high,
+                order=int(p.get('bp_order', 4)),
+                mode=str(p.get('bp_mode', 'gpr')),
+            )
+            return
+
+        if stage_name == 'gain':
+            proc.apply_gain(
+                gain_type=str(p.get('gain_type', 'agc')),
+                factor=float(p.get('gain_factor', 20.0)),
+                alpha=float(p.get('gain_alpha', 0.5)),
+                t_start_ns=float(p.get('gain_tstart', 5.0)),
+                window_ns=float(p.get('gain_agcwin', 25.0)),
+                agc_start_ns=float(p.get('gain_agc_start', 0.0)),
+            )
+
+    def run(self):
+        try:
+            project = self.project_path
+            raw_dir = project / 'raw'
+            if not raw_dir.exists():
+                raise RuntimeError(f'Project raw directory not found: {raw_dir}')
+
+            stage_plan = _build_batch_stage_plan(self.pipeline_params)
+            if not stage_plan:
+                raise RuntimeError('No batch stage enabled (Stack/Time0/Dewow/Background/Bandpass/Gain).')
+            for stage in stage_plan:
+                (project / stage['folder']).mkdir(parents=True, exist_ok=True)
+
+            raw_files = sorted(raw_dir.glob('*.ogpr'))
+            if not raw_files:
+                raise RuntimeError(f'No OGPR files found in: {raw_dir}')
+
+            meta_path = project / 'metadata.json'
+            meta_doc = _read_json(meta_path, default={})
+            if 'processing_log' not in meta_doc or not isinstance(meta_doc['processing_log'], list):
+                meta_doc['processing_log'] = []
+
+            run_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+            run_log: Dict[str, Any] = {
+                'run_id': run_id,
+                'started_at': datetime.now().isoformat(),
+                'pipeline': self.pipeline_params,
+                'stages': [s['name'] for s in stage_plan],
+                'inputs': [f.name for f in raw_files],
+                'outputs': [],
+            }
+
+            self.progress.emit(f'Batch start: {len(raw_files)} file(s), stages={run_log["stages"]}')
+
+            for file_idx, ogpr_file in enumerate(raw_files, start=1):
+                if self.isInterruptionRequested():
+                    raise RuntimeError('Batch processing interrupted.')
+
+                size_mb = ogpr_file.stat().st_size / (1024 * 1024)
+                parser = OGPRParser(str(ogpr_file))
+                data_dict = parser.load_data(lazy=(size_mb > 150))
+                rv = data_dict['radar_volume']
+                geolocations = data_dict.get('geolocations')
+                meta = data_dict['metadata']
+                dt_ns = float(meta.get('sampling_time_ns', np.nan))
+                dx_m = float(meta.get('sampling_step_m', 0.05))
+                n_ch = int(meta.get('channels_count', rv.shape[1]))
+
+                self.progress.emit(
+                    f'[{file_idx}/{len(raw_files)}] {ogpr_file.name}: {n_ch} channel(s)'
+                )
+
+                for ch in range(n_ch):
+                    if self.isInterruptionRequested():
+                        raise RuntimeError('Batch processing interrupted.')
+
+                    proc = SignalProcessor(
+                        rv[:, ch, :],
+                        sampling_time_ns=dt_ns,
+                        trace_spacing_m=dx_m,
+                    )
+                    base_name = f'{ogpr_file.stem}__ch{ch:02d}'
+
+                    for stage_idx, stage in enumerate(stage_plan, start=1):
+                        self._apply_stage(
+                            stage_name=stage['name'],
+                            proc=proc,
+                            meta=meta,
+                            geolocations=geolocations,
+                            channel=ch,
+                        )
+                        out = proc.get_processed_data()
+                        t = proc.get_time_axis()
+
+                        out_file = project / stage['folder'] / f'{base_name}.npz'
+                        np.savez_compressed(
+                            out_file,
+                            data=np.asarray(out),
+                            time_ns=np.asarray(t, dtype=np.float32),
+                            trace_spacing_m=float(proc.trace_spacing_m),
+                            sampling_time_ns=float(dt_ns),
+                            source_file=ogpr_file.name,
+                            swath_name=str(meta.get('swath_name', 'Unknown')),
+                            channel=int(ch),
+                            stage=str(stage['name']),
+                            stage_index=int(stage_idx),
+                            run_id=str(run_id),
+                        )
+                        run_log['outputs'].append(str(out_file.relative_to(project)))
+
+                self.progress.emit(
+                    f'Completed {ogpr_file.name} ({file_idx}/{len(raw_files)})'
+                )
+
+            run_log['completed_at'] = datetime.now().isoformat()
+            run_log['status'] = 'ok'
+            meta_doc['processing_log'].append(run_log)
+            _write_json(meta_path, meta_doc)
+
+            self.finished.emit(
+                f'Batch completed: {len(raw_files)} file(s), {len(run_log["outputs"])} stage file(s)'
+            )
+
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -447,6 +929,9 @@ class OGPRViewerMainWindow(QMainWindow):
         self._swath_entries: List[SwathSidebarEntry] = []
         self._proc_worker: Optional[ProcessingThread] = None
         self._proc_workers: List[ProcessingThread] = []
+        self._batch_worker: Optional[BatchProcessingThread] = None
+        self._batch_workers: List[BatchProcessingThread] = []
+        self.project_path: Optional[Path] = None
         self._render_request_id: int = 0
 
         self._build_ui()
@@ -531,6 +1016,7 @@ class OGPRViewerMainWindow(QMainWindow):
         layout.addWidget(hdr)
 
         layout.addWidget(self._grp_pipeline())
+        layout.addWidget(self._grp_spatial_stack())
         layout.addWidget(self._grp_timezero())
         layout.addWidget(self._grp_topography())
         layout.addWidget(self._grp_dewow())
@@ -616,6 +1102,9 @@ class OGPRViewerMainWindow(QMainWindow):
 
         self.cb_dewow_first = QCheckBox('Dewow before Time0')
         self.cb_dewow_first.stateChanged.connect(self._apply_and_render)
+        self.cb_dewow_first.blockSignals(True)
+        self.cb_dewow_first.setChecked(True)
+        self.cb_dewow_first.blockSignals(False)
         v.addWidget(self.cb_dewow_first)
 
         self.pipeline_summary = QLabel('RAW only')
@@ -626,12 +1115,26 @@ class OGPRViewerMainWindow(QMainWindow):
 
         g.setLayout(v); return g
 
+    def _grp_spatial_stack(self):
+        g = QGroupBox('Spatial Stacking / Smoothing'); v = QVBoxLayout()
+        self._cb(v, 'Enable', 'cb_stack')
+        self._ispin(v, '  Window:', 'stack_win_traces', 1, 401, 5, ' trc')
+        self._ispin(v, '  Decimation:', 'stack_decim', 1, 128, 1, ' x')
+        self._cb(v, '  Auto decimation = window when decim=1', 'cb_stack_auto_decim')
+        self.cb_stack_auto_decim.blockSignals(True)
+        self.cb_stack_auto_decim.setChecked(True)
+        self.cb_stack_auto_decim.blockSignals(False)
+        v.addWidget(QLabel(
+            '<small><i>Use on ultra-dense profiles before background removal.</i></small>'
+        ))
+        g.setLayout(v); return g
+
     def _grp_timezero(self):
         g = QGroupBox('Time-Zero Correction'); v = QVBoxLayout()
         self._cb(v, 'Enable', 'cb_t0')
-        self._combo(v, '  Correction:', 'tz_mode', ['scan', 'line'])
+        self._combo(v, '  Correction:', 'tz_mode', ['line', 'scan'])
         self._combo(v, '  Method:', 'tz_method', ['threshold', 'max', 'xcorr'])
-        self._dspin(v, '  Threshold:', 'tz_thresh', 0.01, 0.99, 0.10, 0.01)
+        self._dspin(v, '  Threshold:', 'tz_thresh', 0.02, 0.10, 0.08, 0.01)
         self._dspin(v, '  Top mute:', 'top_mute_ns', 0.0, 60.0, 0.0, 0.5, ' ns')
         g.setLayout(v); return g
 
@@ -654,7 +1157,7 @@ class OGPRViewerMainWindow(QMainWindow):
     def _grp_background(self):
         g = QGroupBox('Background Removal'); v = QVBoxLayout()
         self._cb(v, 'Enable', 'cb_bg')
-        self._combo(v, '  Method:', 'bg_method', ['mean', 'median', 'trimmed'])
+        self._combo(v, '  Method:', 'bg_method', ['median', 'trimmed', 'mean'])
         self._dspin(v, '  Trim (%):', 'bg_trim_pct', 0.0, 30.0, 10.0, 1.0, ' %')
         self._cb(v, '  Rolling window', 'cb_bg_rolling')
         self._ispin(v, '  Win traces:', 'bg_win_traces', 5, 500, 50, ' trc')
@@ -664,6 +1167,10 @@ class OGPRViewerMainWindow(QMainWindow):
         g = QGroupBox('Bandpass Filter'); v = QVBoxLayout()
         self._cb(v, 'Enable', 'cb_bp')
         self._combo(v, '  Type:',  'bp_mode',  ['gpr', 'butter'])
+        self._cb(v, '  Auto from antenna metadata', 'cb_bp_auto')
+        self.cb_bp_auto.blockSignals(True)
+        self.cb_bp_auto.setChecked(True)
+        self.cb_bp_auto.blockSignals(False)
         self._dspin(v, '  Low:',   'bp_low',   1.0, 4000.0, 100.0, 10.0, ' MHz')
         self._dspin(v, '  High:',  'bp_high',  1.0, 4000.0, 800.0, 10.0, ' MHz')
         self._ispin(v, '  Order:', 'bp_order', 1, 8, 4)
@@ -718,7 +1225,7 @@ class OGPRViewerMainWindow(QMainWindow):
         v.addWidget(QLabel(
             '<small><i>Uses the velocity set in Display \u2193</i></small>'
         ))
-        self._ispin(v, '  Aperture:', 'mig_aperture', 5, 200, 30, ' trc')
+        self._ispin(v, '  Aperture:', 'mig_aperture', 5, 200, 12, ' trc')
         g.setLayout(v); return g
 
     # ------------------------------------------------------------------
@@ -982,6 +1489,9 @@ class OGPRViewerMainWindow(QMainWindow):
         btn = QPushButton('Export current view\u2026')
         btn.clicked.connect(self._export)
         v.addWidget(btn)
+        b2 = QPushButton('Batch process project\u2026')
+        b2.clicked.connect(self._run_project_batch)
+        v.addWidget(b2)
         dbg = QPushButton('Export debug bundle (.zip)\u2026')
         dbg.clicked.connect(self._export_debug_bundle)
         v.addWidget(dbg)
@@ -994,6 +1504,20 @@ class OGPRViewerMainWindow(QMainWindow):
     def _build_menu(self):
         mb = self.menuBar()
         fm = mb.addMenu('&File')
+        npj = QAction('&New Project\u2026', self)
+        npj.setShortcut('Ctrl+Shift+N')
+        npj.triggered.connect(self._new_project)
+        fm.addAction(npj)
+        opj = QAction('&Open Project\u2026', self)
+        opj.triggered.connect(self._open_project)
+        fm.addAction(opj)
+        addraw = QAction('Add Loaded Files To Project &Raw', self)
+        addraw.triggered.connect(self._add_loaded_files_to_project_raw)
+        fm.addAction(addraw)
+        runbatch = QAction('&Run Project Batch Processing', self)
+        runbatch.triggered.connect(self._run_project_batch)
+        fm.addAction(runbatch)
+        fm.addSeparator()
         a = QAction('&Open OGPR file(s)\u2026', self)
         a.setShortcut(QKeySequence.StandardKey.Open)
         a.triggered.connect(self.open_files)
@@ -1016,6 +1540,160 @@ class OGPRViewerMainWindow(QMainWindow):
         self.status = QStatusBar()
         self.setStatusBar(self.status)
         self.status.showMessage('Ready \u2013 open OGPR files to start.')
+
+    # ------------------------------------------------------------------
+    # Project management
+    # ------------------------------------------------------------------
+
+    def _set_project_path(self, project_path: Optional[Path]):
+        self.project_path = project_path
+        base_title = 'OGPR Radar Viewer'
+        if project_path is None:
+            self.setWindowTitle(base_title)
+            return
+        self.setWindowTitle(f'{base_title}  [{project_path.name}]')
+
+    def _new_project(self):
+        root_dir = QFileDialog.getExistingDirectory(
+            self, 'Select project root folder', self.last_directory
+        )
+        if not root_dir:
+            return
+        name, ok = QInputDialog.getText(self, 'New Project', 'Project name:')
+        if not ok:
+            return
+        project_name = _sanitize_project_name(name)
+        if not project_name:
+            QMessageBox.warning(self, 'New Project', 'Invalid project name.')
+            return
+
+        try:
+            p = _create_project_structure(root_dir, project_name)
+            self._set_project_path(p)
+            self.status.showMessage(f'Project created: {p}', 5000)
+            self.last_directory = str(p)
+            self.settings.setValue('last_directory', self.last_directory)
+
+            if self._swath_entries:
+                self._add_loaded_files_to_project_raw()
+        except Exception as e:
+            LOG.error(f'Project creation error: {e}\n{traceback.format_exc()}')
+            QMessageBox.critical(self, 'New Project error', str(e))
+
+    def _open_project(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, 'Open project folder', self.last_directory
+        )
+        if not folder:
+            return
+        p = Path(folder)
+        if not (p / 'metadata.json').exists() or not (p / 'raw').exists():
+            QMessageBox.warning(
+                self, 'Open Project',
+                f'Not a valid OGPR project folder:\n{p}'
+            )
+            return
+        self._set_project_path(p)
+        self.status.showMessage(f'Project opened: {p}', 5000)
+        self.last_directory = str(p)
+        self.settings.setValue('last_directory', self.last_directory)
+
+    def _add_loaded_files_to_project_raw(self):
+        if self.project_path is None:
+            QMessageBox.information(self, 'Project', 'Create or open a project first.')
+            return
+        if not self._swath_entries:
+            QMessageBox.information(self, 'Project', 'No loaded swaths to copy.')
+            return
+
+        raw_dir = self.project_path / 'raw'
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        sources = sorted({
+            str(e.data_dict.get('filepath', ''))
+            for e in self._swath_entries
+            if str(e.data_dict.get('filepath', '')).lower().endswith('.ogpr')
+        })
+        copied = 0
+        skipped = 0
+        for src in sources:
+            sp = Path(src)
+            if not sp.exists():
+                skipped += 1
+                continue
+            dst = raw_dir / sp.name
+            if dst.exists() and (dst.stat().st_size == sp.stat().st_size):
+                skipped += 1
+                continue
+            shutil.copy2(sp, dst)
+            copied += 1
+
+        self.status.showMessage(
+            f'Project raw updated: copied={copied}, skipped={skipped}',
+            5000,
+        )
+
+    def _run_project_batch(self):
+        if self.project_path is None:
+            QMessageBox.information(self, 'Batch processing', 'Create or open a project first.')
+            return
+        if self._batch_worker is not None and self._batch_worker.isRunning():
+            QMessageBox.information(self, 'Batch processing', 'Batch is already running.')
+            return
+
+        p = self._params()
+        self._batch_worker = BatchProcessingThread(
+            project_path=str(self.project_path),
+            pipeline_params=p,
+        )
+        self._batch_workers.append(self._batch_worker)
+        self._batch_worker.progress.connect(self._on_batch_progress)
+        self._batch_worker.finished.connect(self._on_batch_finished)
+        self._batch_worker.error.connect(self._on_batch_error)
+        self.status.showMessage('Starting project batch processing…')
+        self._batch_worker.start()
+
+    def _cancel_batch_worker(self):
+        w = self._batch_worker
+        if w is None:
+            return
+        if w.isRunning():
+            w.requestInterruption()
+        self._batch_worker = None
+
+    def _on_batch_progress(self, msg: str):
+        self.status.showMessage(msg)
+
+    def _on_batch_finished(self, msg: str):
+        w = self.sender()
+        if isinstance(w, BatchProcessingThread):
+            if w.isRunning():
+                w.requestInterruption()
+                if not w.wait(2000):
+                    LOG.warning('Batch thread still running during finish callback; cleanup deferred.')
+                    return
+            if w in self._batch_workers:
+                self._batch_workers.remove(w)
+            if w is self._batch_worker:
+                self._batch_worker = None
+            w.deleteLater()
+        self.status.showMessage(msg, 8000)
+
+    def _on_batch_error(self, msg: str):
+        w = self.sender()
+        if isinstance(w, BatchProcessingThread):
+            if w.isRunning():
+                w.requestInterruption()
+                if not w.wait(2000):
+                    LOG.warning('Batch thread still running during error callback; cleanup deferred.')
+                    return
+            if w in self._batch_workers:
+                self._batch_workers.remove(w)
+            if w is self._batch_worker:
+                self._batch_worker = None
+            w.deleteLater()
+        LOG.error(f'Batch processing error: {msg}')
+        QMessageBox.warning(self, 'Batch processing error', msg)
+        self.status.showMessage('Batch processing failed.', 5000)
 
     # ------------------------------------------------------------------
     # File loading
@@ -1043,6 +1721,12 @@ class OGPRViewerMainWindow(QMainWindow):
         loader.start()
 
     def _on_loaded(self, data_dict: dict):
+        loader = self.sender()
+        if isinstance(loader, FileLoaderThread):
+            if loader in self._loaders:
+                self._loaders.remove(loader)
+            loader.deleteLater()
+
         entry = SwathSidebarEntry(data_dict)
         entry.visibility_changed.connect(self._apply_and_render)
         entry.channel_changed.connect(self._apply_and_render)
@@ -1067,6 +1751,12 @@ class OGPRViewerMainWindow(QMainWindow):
         self._apply_and_render()
 
     def _on_error(self, msg: str):
+        loader = self.sender()
+        if isinstance(loader, FileLoaderThread):
+            if loader in self._loaders:
+                self._loaders.remove(loader)
+            loader.deleteLater()
+
         LOG.error(f'Load error: {msg}')
         QMessageBox.critical(self, 'Load error', msg)
         self.status.showMessage('Error loading file.')
@@ -1085,6 +1775,10 @@ class OGPRViewerMainWindow(QMainWindow):
         v = self.velocity_spin.value()
         return {
             'dewow_first': self.cb_dewow_first.isChecked(),
+            'stack':       self.cb_stack.isChecked(),
+            'stack_win_trc': self.stack_win_traces.value(),
+            'stack_decim': self.stack_decim.value(),
+            'stack_auto_decim': self.cb_stack_auto_decim.isChecked(),
             't0':          self.cb_t0.isChecked(),
             'tz_mode':     self.tz_mode.currentText(),
             'tz_method':   self.tz_method.currentText(),
@@ -1102,6 +1796,7 @@ class OGPRViewerMainWindow(QMainWindow):
             'bg_win_trc':  self.bg_win_traces.value(),
             'bp':          self.cb_bp.isChecked(),
             'bp_mode':     self.bp_mode.currentText(),
+            'bp_auto':     self.cb_bp_auto.isChecked(),
             'bp_low':      self.bp_low.value(),
             'bp_high':     self.bp_high.value(),
             'bp_order':    self.bp_order.value(),
@@ -1190,6 +1885,11 @@ class OGPRViewerMainWindow(QMainWindow):
 
     def _update_pipeline_summary(self, p: dict):
         steps = []
+        if p['stack']:
+            if p.get('stack_auto_decim', False) and int(p['stack_decim']) <= 1 and int(p['stack_win_trc']) > 1:
+                steps.append(f"Stack(w{p['stack_win_trc']},d=auto->{p['stack_win_trc']})")
+            else:
+                steps.append(f"Stack(w{p['stack_win_trc']},d{p['stack_decim']})")
         if p['dewow'] and p['t0'] and p['dewow_first']:
             steps.append('Order(DW->T0)')
         if p['t0']:
@@ -1207,7 +1907,10 @@ class OGPRViewerMainWindow(QMainWindow):
             else:
                 steps.append(f"BG({p['bg_method']},{mode})")
         if p['bp']:
-            steps.append(f"BP({p['bp_mode']} {p['bp_low']:.0f}-{p['bp_high']:.0f} MHz)")
+            if p.get('bp_auto', False):
+                steps.append(f"BP({p['bp_mode']} auto)")
+            else:
+                steps.append(f"BP({p['bp_mode']} {p['bp_low']:.0f}-{p['bp_high']:.0f} MHz)")
         if p['notch']:
             steps.append(f"Notch({p['notch_freq']:.0f} MHz)")
         if p['sw']:
@@ -1231,7 +1934,9 @@ class OGPRViewerMainWindow(QMainWindow):
         if preset == 'Raw view':
             vals = {
                 'dewow_first': False,
+                'stack': False, 'stack_win': 5, 'stack_decim': 1, 'stack_auto_decim': True,
                 't0': False, 'dewow': False, 'bg': False, 'bp': False,
+                'bp_auto': False,
                 'notch': False, 'sw': False, 'gain': False,
                 'hilbert': False, 'norm': False, 'mig': False,
                 'top_mute_ns': 0.0,
@@ -1240,13 +1945,14 @@ class OGPRViewerMainWindow(QMainWindow):
             }
         elif preset == 'Basic clean (Matlab-like)':
             vals = {
-                'dewow_first': False,
-                't0': True, 'tz_mode': 'scan', 'tz_method': 'threshold', 'tz_thresh': 0.10,
+                'dewow_first': True,
+                'stack': False, 'stack_win': 5, 'stack_decim': 1, 'stack_auto_decim': True,
+                't0': True, 'tz_mode': 'line', 'tz_method': 'threshold', 'tz_thresh': 0.08,
                 'top_mute_ns': 0.0,
                 'static_corr': False, 'static_ref': 'max', 'static_two_way': False,
                 'dewow': False,
-                'bg': True, 'bg_method': 'mean', 'bg_trim_pct': 10.0, 'bg_roll': False, 'bg_win': 50,
-                'bp': True, 'bp_mode': 'gpr', 'bp_low': 100.0, 'bp_high': 600.0, 'bp_order': 4,
+                'bg': True, 'bg_method': 'median', 'bg_trim_pct': 10.0, 'bg_roll': False, 'bg_win': 50,
+                'bp': True, 'bp_mode': 'gpr', 'bp_auto': True, 'bp_low': 200.0, 'bp_high': 600.0, 'bp_order': 4,
                 'notch': False, 'sw': False,
                 'gain': True, 'gain_type': 'agc', 'gain_factor': 10.0,
                 'gain_agcwin': 25.0, 'gain_agc_start': 0.0,
@@ -1254,13 +1960,14 @@ class OGPRViewerMainWindow(QMainWindow):
             }
         elif preset == 'Archaeo detail':
             vals = {
-                'dewow_first': False,
-                't0': True, 'tz_mode': 'scan', 'tz_method': 'threshold', 'tz_thresh': 0.08,
+                'dewow_first': True,
+                'stack': False, 'stack_win': 5, 'stack_decim': 1, 'stack_auto_decim': True,
+                't0': True, 'tz_mode': 'line', 'tz_method': 'threshold', 'tz_thresh': 0.08,
                 'top_mute_ns': 0.0,
                 'static_corr': False, 'static_ref': 'max', 'static_two_way': False,
                 'dewow': True, 'dewow_win': 60,
                 'bg': True, 'bg_method': 'trimmed', 'bg_trim_pct': 12.0, 'bg_roll': True, 'bg_win': 80,
-                'bp': True, 'bp_mode': 'gpr', 'bp_low': 80.0, 'bp_high': 700.0, 'bp_order': 4,
+                'bp': True, 'bp_mode': 'gpr', 'bp_auto': False, 'bp_low': 100.0, 'bp_high': 700.0, 'bp_order': 4,
                 'notch': False, 'sw': False,
                 'gain': True, 'gain_type': 'sec', 'gain_factor': 20.0,
                 'gain_alpha': 0.4, 'gain_tstart': 5.0,
@@ -1269,13 +1976,14 @@ class OGPRViewerMainWindow(QMainWindow):
             }
         elif preset == 'Noisy ground':
             vals = {
-                'dewow_first': False,
-                't0': True, 'tz_mode': 'line', 'tz_method': 'xcorr', 'tz_thresh': 0.10,
+                'dewow_first': True,
+                'stack': True, 'stack_win': 5, 'stack_decim': 1, 'stack_auto_decim': True,
+                't0': True, 'tz_mode': 'line', 'tz_method': 'xcorr', 'tz_thresh': 0.08,
                 'top_mute_ns': 0.0,
                 'static_corr': False, 'static_ref': 'max', 'static_two_way': False,
                 'dewow': True, 'dewow_win': 80,
                 'bg': True, 'bg_method': 'trimmed', 'bg_trim_pct': 15.0, 'bg_roll': True, 'bg_win': 60,
-                'bp': True, 'bp_mode': 'butter', 'bp_low': 120.0, 'bp_high': 550.0, 'bp_order': 4,
+                'bp': True, 'bp_mode': 'butter', 'bp_auto': False, 'bp_low': 120.0, 'bp_high': 550.0, 'bp_order': 4,
                 'notch': True, 'notch_freq': 50.0, 'notch_bw': 5.0,
                 'sw': False,
                 'gain': True, 'gain_type': 'agc', 'gain_factor': 8.0,
@@ -1285,12 +1993,13 @@ class OGPRViewerMainWindow(QMainWindow):
         else:  # Stream UP stable
             vals = {
                 'dewow_first': True,
-                't0': True, 'tz_mode': 'scan', 'tz_method': 'threshold', 'tz_thresh': 0.08,
+                'stack': True, 'stack_win': 7, 'stack_decim': 2, 'stack_auto_decim': True,
+                't0': True, 'tz_mode': 'line', 'tz_method': 'threshold', 'tz_thresh': 0.08,
                 'top_mute_ns': 3.0,
                 'static_corr': False, 'static_ref': 'max', 'static_two_way': False,
                 'dewow': True, 'dewow_win': 80,
                 'bg': True, 'bg_method': 'trimmed', 'bg_trim_pct': 12.0, 'bg_roll': True, 'bg_win': 250,
-                'bp': True, 'bp_mode': 'gpr', 'bp_low': 80.0, 'bp_high': 650.0, 'bp_order': 4,
+                'bp': True, 'bp_mode': 'gpr', 'bp_auto': True, 'bp_low': 200.0, 'bp_high': 600.0, 'bp_order': 4,
                 'notch': False, 'sw': False,
                 'gain': True, 'gain_type': 'sec', 'gain_factor': 18.0,
                 'gain_alpha': 0.35, 'gain_tstart': 6.0,
@@ -1299,6 +2008,10 @@ class OGPRViewerMainWindow(QMainWindow):
             }
 
         self._set_check(self.cb_dewow_first, vals.get('dewow_first', self.cb_dewow_first.isChecked()))
+        self._set_check(self.cb_stack, vals.get('stack', self.cb_stack.isChecked()))
+        self._set_ispin(self.stack_win_traces, vals.get('stack_win', self.stack_win_traces.value()))
+        self._set_ispin(self.stack_decim, vals.get('stack_decim', self.stack_decim.value()))
+        self._set_check(self.cb_stack_auto_decim, vals.get('stack_auto_decim', self.cb_stack_auto_decim.isChecked()))
         self._set_check(self.cb_t0, vals.get('t0', self.cb_t0.isChecked()))
         self._set_combo(self.tz_mode, vals.get('tz_mode', self.tz_mode.currentText()))
         self._set_combo(self.tz_method, vals.get('tz_method', self.tz_method.currentText()))
@@ -1316,6 +2029,7 @@ class OGPRViewerMainWindow(QMainWindow):
         self._set_ispin(self.bg_win_traces, vals.get('bg_win', self.bg_win_traces.value()))
         self._set_check(self.cb_bp, vals.get('bp', self.cb_bp.isChecked()))
         self._set_combo(self.bp_mode, vals.get('bp_mode', self.bp_mode.currentText()))
+        self._set_check(self.cb_bp_auto, vals.get('bp_auto', self.cb_bp_auto.isChecked()))
         self._set_dspin(self.bp_low, vals.get('bp_low', self.bp_low.value()))
         self._set_dspin(self.bp_high, vals.get('bp_high', self.bp_high.value()))
         self._set_ispin(self.bp_order, vals.get('bp_order', self.bp_order.value()))
@@ -1409,6 +2123,11 @@ class OGPRViewerMainWindow(QMainWindow):
     def _on_processing_finished(self, req_id: int, panels: list):
         w = self.sender()
         if isinstance(w, ProcessingThread):
+            if w.isRunning():
+                w.requestInterruption()
+                if not w.wait(2000):
+                    LOG.warning('Processing thread still running during finish callback; cleanup deferred.')
+                    return
             if w in self._proc_workers:
                 self._proc_workers.remove(w)
             if w is self._proc_worker:
@@ -1432,6 +2151,11 @@ class OGPRViewerMainWindow(QMainWindow):
     def _on_processing_error(self, req_id: int, msg: str):
         w = self.sender()
         if isinstance(w, ProcessingThread):
+            if w.isRunning():
+                w.requestInterruption()
+                if not w.wait(2000):
+                    LOG.warning('Processing thread still running during error callback; cleanup deferred.')
+                    return
             if w in self._proc_workers:
                 self._proc_workers.remove(w)
             if w is self._proc_worker:
@@ -1593,9 +2317,10 @@ class OGPRViewerMainWindow(QMainWindow):
     def _reset_filters(self):
         for cb in [
             self.cb_dewow_first,
+            self.cb_stack, self.cb_stack_auto_decim,
             self.cb_static_corr, self.cb_static_two_way,
             self.cb_t0, self.cb_dewow, self.cb_bg, self.cb_bg_rolling,
-            self.cb_bp, self.cb_notch, self.cb_sw, self.cb_sw_bp,
+            self.cb_bp, self.cb_bp_auto, self.cb_notch, self.cb_sw, self.cb_sw_bp,
             self.cb_gain, self.cb_hilbert, self.cb_norm, self.cb_mig,
             self.cb_limit_view,
         ]:
@@ -1615,6 +2340,11 @@ class OGPRViewerMainWindow(QMainWindow):
         self._set_combo(self.norm_scale_combo, 'linear')
         self._set_dspin(self.symlog_linthresh_pct, 3.0)
         self._set_combo(self.static_ref_mode, 'max')
+        self._set_combo(self.tz_mode, 'line')
+        self._set_combo(self.bg_method, 'median')
+        self._set_ispin(self.stack_win_traces, 5)
+        self._set_ispin(self.stack_decim, 1)
+        self._set_check(self.cb_stack_auto_decim, True)
         self._set_check(self.cb_wiggle_overlay, False)
         self.wiggle_scale.setEnabled(False)
         self.wiggle_stride.setEnabled(False)
@@ -1625,6 +2355,10 @@ class OGPRViewerMainWindow(QMainWindow):
         self._set_dspin(self.top_mute_ns, 0.0)
         self._set_dspin(self.gain_agc_start, 0.0)
         self._set_dspin(self.aspect_factor_spin, 0.50)
+        self._set_check(self.cb_dewow_first, True)
+        self._set_check(self.cb_bp_auto, True)
+        self._set_dspin(self.tz_thresh, 0.08)
+        self._set_ispin(self.mig_aperture, 12)
         self._set_check(self.cb_lock_x_scale, True)
         self._set_dspin(self.x_display_width_m, 200.0)
         self.x_display_width_m.setEnabled(True)
@@ -1652,16 +2386,56 @@ class OGPRViewerMainWindow(QMainWindow):
             QMessageBox.information(self, 'Log', f'Not found:\n{log_path}')
 
     def closeEvent(self, event):
+        busy_threads = []
+        loaders_running: List[FileLoaderThread] = []
+        for w in list(self._loaders):
+            try:
+                if w.isRunning():
+                    if not w.wait(5000):
+                        busy_threads.append('loader')
+                        loaders_running.append(w)
+                        continue
+                w.deleteLater()
+            except Exception:
+                pass
+        self._loaders = loaders_running
+
         self._cancel_processing_worker()
+        proc_running: List[ProcessingThread] = []
         for w in list(self._proc_workers):
             try:
                 if w.isRunning():
                     w.requestInterruption()
-                    w.wait(50)
+                    if not w.wait(5000):
+                        busy_threads.append('processing')
+                        proc_running.append(w)
+                        continue
                 w.deleteLater()
             except Exception:
                 pass
-        self._proc_workers.clear()
+        self._proc_workers = proc_running
+        self._cancel_batch_worker()
+        batch_running: List[BatchProcessingThread] = []
+        for w in list(self._batch_workers):
+            try:
+                if w.isRunning():
+                    w.requestInterruption()
+                    if not w.wait(5000):
+                        busy_threads.append('batch')
+                        batch_running.append(w)
+                        continue
+                w.deleteLater()
+            except Exception:
+                pass
+        self._batch_workers = batch_running
+        if busy_threads:
+            QMessageBox.warning(
+                self,
+                'Shutdown in progress',
+                'There are still active worker threads. Please wait a few seconds and close again.',
+            )
+            event.ignore()
+            return
         self.settings.setValue('last_directory', self.last_directory)
         LOG.info('Closed')
         event.accept()
