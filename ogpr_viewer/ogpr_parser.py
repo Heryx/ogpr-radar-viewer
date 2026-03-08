@@ -16,6 +16,14 @@ On-disk memory layout (IDS format):
   Data is written trace-by-trace: for each slice, all channels, all samples.
   Binary order: (slices, channels, samples)  <- C-order on disk
   After reshape + transpose -> (samples, channels, slices)  <- viewer convention
+
+Dtype policy:
+  float32 files (IDS Stream UP): kept as float32 throughout.
+                                  Values are physical voltage units.
+  int16 files   (IDS Stream DP): kept as int16 throughout.
+                                  Values are raw ADC counts.
+  NO automatic dtype conversion is performed.
+  SignalProcessor handles each dtype natively.
 """
 
 import logging
@@ -35,6 +43,8 @@ class OGPRParser:
       - 'valueType': 'float'  => np.float32  (IDS Stream UP)
       - 'valueType': 'int'    => np.int16    (IDS Stream DP)
       - absent (v1)           => np.float32  (default)
+
+    The detected dtype is preserved as-is. No conversion is applied.
     """
 
     _DTYPE_MAP = {
@@ -244,23 +254,19 @@ class OGPRParser:
                     f'{dtype.__name__}, got {byte_size}. Data may be corrupt.'
                 )
 
-        # IDS on-disk layout: (slices, channels, samples) — C-order
-        # We read with the correct on-disk shape, then transpose to
-        # viewer convention: (samples, channels, slices)
-        disk_shape   = (slices, channels, samples)
-        viewer_shape = (samples, channels, slices)  # after transpose
+        # IDS on-disk layout: (slices, channels, samples) - C-order
+        # Transpose to viewer convention: (samples, channels, slices)
+        disk_shape = (slices, channels, samples)
 
         if lazy:
-            # memmap with disk shape, then transpose to a view
-            raw = np.memmap(
+            raw  = np.memmap(
                 self.filepath, dtype=dtype, mode='r',
                 offset=byte_offset, shape=disk_shape
             )
-            # np.transpose returns a view — no copy, memory-efficient
             data = np.transpose(raw, (2, 1, 0))
             LOG.debug(
                 f'memmap loaded: disk_shape={disk_shape} '
-                f'-> transposed viewer_shape={data.shape}'
+                f'-> transposed viewer_shape={data.shape}  dtype={data.dtype}'
             )
         else:
             with open(self.filepath, 'rb') as f:
@@ -270,12 +276,17 @@ class OGPRParser:
             data = np.ascontiguousarray(np.transpose(data, (2, 1, 0)))
             LOG.debug(
                 f'loaded: disk_shape={disk_shape} '
-                f'-> transposed viewer_shape={data.shape}'
+                f'-> transposed viewer_shape={data.shape}  dtype={data.dtype}'
             )
 
-        if dtype == np.int16:
-            LOG.debug('Converting int16 -> float32')
-            data = data.astype(np.float32)
+        # DTYPE POLICY: no conversion here.
+        # float32 stays float32 (Stream UP physical voltage)
+        # int16   stays int16   (Stream DP raw ADC counts)
+        # SignalProcessor handles both natively.
+        LOG.info(
+            f'Radar volume loaded: shape={data.shape}  dtype={data.dtype}  '
+            f'(NO dtype conversion applied)'
+        )
 
         self.radar_data = data
         return data
