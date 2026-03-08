@@ -7,9 +7,9 @@ Supports IDS Stream UP (float32) and IDS Stream DP (int16) antenna types.
 
 Header format (newline-separated text lines):
   Line 1: "ogpr"
-  Line 2: UUID  (32 hex chars)
-  Line 3: data offset  (8 hex chars, used only as cross-check)
-  Remaining text: JSON descriptor  <- read by brace-balancing, NOT by byte offset
+  Line 2: MD5  (32 hex chars)
+  Line 3: JSON header size (8 decimal chars, zero-padded)
+  Remaining text: JSON descriptor (header_size bytes)
   After JSON: binary data blocks
 
 On-disk memory layout (IDS format):
@@ -65,6 +65,9 @@ class OGPRParser:
         self.radar_data: Optional[np.ndarray] = None
         self.geolocations: Optional[np.ndarray] = None
         self._file_size = self.filepath.stat().st_size
+        self._header_size: Optional[int] = None
+        self._json_start: int = 0
+        self._json_end: int = 0
 
     # ------------------------------------------------------------------
     # Low-level helpers
@@ -141,15 +144,44 @@ class OGPRParser:
                 raise ValueError(
                     f"Invalid OGPR signature: '{signature}' (expected 'ogpr')"
                 )
-            _uuid      = self._read_line(f)
-            offset_hex = self._read_line(f).strip()
+            _md5 = self._read_line(f)
+            header_size_str = self._read_line(f).strip()
+
+            # OGPR preamble (v2): 8-digit decimal JSON header size.
+            # Fallback to hex for non-standard files found in the wild.
+            header_size = None
             try:
-                self._data_offset = int(offset_hex, 16)
-            except ValueError as exc:
-                raise ValueError(
-                    f"Cannot parse data offset '{offset_hex}' as hex: {exc}"
-                ) from exc
-            json_text = self._read_json_by_braces(f)
+                header_size = int(header_size_str, 10)
+            except ValueError:
+                try:
+                    header_size = int(header_size_str, 16)
+                    LOG.warning(
+                        f"Header size '{header_size_str}' parsed as hex fallback."
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Cannot parse JSON header size '{header_size_str}' "
+                        f"(expected decimal 8 chars)."
+                    ) from exc
+
+            self._header_size = int(max(0, header_size))
+            self._json_start = int(f.tell())
+
+            json_text = ''
+            if self._header_size > 0:
+                raw = f.read(self._header_size)
+                json_text = raw.decode('utf-8', errors='strict').strip('\x00\r\n\t ')
+            self._json_end = int(f.tell())
+
+            # Safety fallback when size-based read fails or is empty.
+            if not json_text.startswith('{'):
+                LOG.warning(
+                    'JSON header not found via declared header size; '
+                    'falling back to brace-balanced parsing.'
+                )
+                f.seek(self._json_start)
+                json_text = self._read_json_by_braces(f)
+                self._json_end = int(f.tell())
 
         if not json_text:
             raise ValueError("No JSON descriptor found in file.")
@@ -157,6 +189,26 @@ class OGPRParser:
             self.descriptor = json.loads(json_text)
         except json.JSONDecodeError as exc:
             raise ValueError(f"Invalid JSON descriptor: {exc}") from exc
+
+        # Cross-check: first binary block should start at json_end.
+        try:
+            offs = [int(b.get('byteOffset', -1)) for b in self.descriptor.get('dataBlockDescriptors', [])]
+            offs = [o for o in offs if o >= 0]
+            if offs:
+                first_off = min(offs)
+                if first_off != self._json_end:
+                    LOG.warning(
+                        f'Header end mismatch: parsed json_end={self._json_end}, '
+                        f'first block byteOffset={first_off}. '
+                        'Using byteOffset from descriptor for data access.'
+                    )
+        except Exception:
+            pass
+
+        LOG.debug(
+            f'Preamble parsed: header_size={self._header_size} '
+            f'json_start={self._json_start} json_end={self._json_end}'
+        )
 
         return self.descriptor
 
@@ -203,6 +255,9 @@ class OGPRParser:
             'version':          self.descriptor.get('version', {'major': 1, 'minor': 0}),
             'dtype':            dtype.__name__,
             'dtype_name':       dtype.__name__,
+            'json_header_size': self._header_size,
+            'json_start':       self._json_start,
+            'json_end':         self._json_end,
         }
 
     # ------------------------------------------------------------------
