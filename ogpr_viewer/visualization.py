@@ -8,10 +8,11 @@ MultiPanelCanvas:
   - X axis: distance in metres (trace_spacing_m * n_traces)
   - Y axis: switchable  time (ns) | depth_rel (m) | depth_abs (m)
   - Dark theme
-  - Symmetric vmin/vmax centred at zero (98th percentile of |data|)
-    Percentile is computed on the sub-surface portion of the data only
-    (skipping the first _DW_SKIP_FRAC of rows = direct-wave + ringing zone)
-    so that strong near-surface signals cannot compress the colour scale.
+  - Configurable symmetric vmin/vmax centred at zero
+    * clip_pct: percentile of |data| for color clipping (default 98.0)
+    * dw_skip_frac: fraction of samples to skip (default 0.25)
+    Percentile is computed on the sub-surface portion only (after skip)
+    to prevent strong near-surface signals from compressing the colour scale.
 """
 
 from __future__ import annotations
@@ -38,15 +39,6 @@ LOG = logging.getLogger('ogpr_viewer')
 
 YMode = Literal['time', 'depth_rel', 'depth_abs']
 
-# Percentile of |sub-surface data| used for symmetric colour clipping.
-_CLIP_PCT = 98.0
-
-# Fraction of the time axis skipped when computing the clipping percentile.
-# For 600 MHz antennas, the direct wave + ringing extends to ~15-20 ns.
-# Skipping the first 25% of samples ensures the colour scale is calibrated
-# to true subsurface reflections, not the near-surface zone.
-_DW_SKIP_FRAC = 0.25
-
 
 # ---------------------------------------------------------------------------
 # Multi-panel canvas
@@ -66,8 +58,25 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
     _MIN_W = 320
     _MIN_H = 220
 
-    def __init__(self, parent=None, dpi: int = 96):
+    def __init__(
+        self, 
+        parent=None, 
+        dpi: int = 96,
+        clip_pct: float = 98.0,
+        dw_skip_frac: float = 0.25,
+    ):
+        """
+        Args:
+            dpi: Display DPI
+            clip_pct: Percentile for symmetric color clipping (90-99.9).
+                      Lower values reveal more detail in saturated data.
+            dw_skip_frac: Fraction of samples to skip when computing percentile (0.0-0.5).
+                          Higher values ignore more of the direct wave zone.
+        """
         self._dpi = dpi
+        self._clip_pct = float(clip_pct)
+        self._dw_skip_frac = float(dw_skip_frac)
+        
         self.fig = Figure(
             figsize=(8, 5),
             dpi=dpi,
@@ -102,6 +111,28 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
             QTimer.singleShot(30, self._re_render)
 
     # ------------------------------------------------------------------
+    # Configuration
+    # ------------------------------------------------------------------
+
+    def set_clip_pct(self, pct: float):
+        """Update color clipping percentile and re-render."""
+        self._clip_pct = float(np.clip(pct, 50.0, 100.0))
+        LOG.debug(f'Clip percentile updated: {self._clip_pct:.1f}%')
+        self._re_render()
+
+    def set_dw_skip_frac(self, frac: float):
+        """Update direct-wave skip fraction and re-render."""
+        self._dw_skip_frac = float(np.clip(frac, 0.0, 0.9))
+        LOG.debug(f'DW skip fraction updated: {self._dw_skip_frac:.1%}')
+        self._re_render()
+
+    def get_clip_pct(self) -> float:
+        return self._clip_pct
+
+    def get_dw_skip_frac(self) -> float:
+        return self._dw_skip_frac
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
@@ -134,17 +165,17 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
                 self._last_t0,
             )
 
-    @staticmethod
     def _symmetric_clim(
+        self,
         data: np.ndarray,
-        pct:  float = _CLIP_PCT,
-        dw_skip_frac: float = _DW_SKIP_FRAC,
     ) -> Tuple[float, float]:
         """
         Compute a symmetric colour range centred at zero.
 
+        Uses instance parameters self._clip_pct and self._dw_skip_frac.
+
         The percentile is computed on the *sub-surface* portion of the data:
-        the first `dw_skip_frac` rows (direct-wave + ringing zone) are
+        the first dw_skip_frac rows (direct-wave + ringing zone) are
         excluded from the calculation so that strong near-surface signals
         cannot compress the colour scale and wash out subsurface reflections.
 
@@ -154,11 +185,11 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
         Returns (vmin, vmax) where vmin = -vmax.
         """
         n_rows = data.shape[0]
-        skip   = max(0, int(n_rows * dw_skip_frac))
+        skip   = max(0, int(n_rows * self._dw_skip_frac))
         d_sub  = data[skip:, :] if n_rows > skip + 4 else data
-        vabs   = float(np.percentile(np.abs(d_sub), pct))
+        vabs   = float(np.percentile(np.abs(d_sub), self._clip_pct))
         if vabs < 1e-10:
-            vabs = float(np.percentile(np.abs(data), pct))
+            vabs = float(np.percentile(np.abs(data), self._clip_pct))
         if vabs < 1e-10:
             vabs = 1.0
         return -vabs, vabs
@@ -259,7 +290,7 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
                     f'Panel {idx}: shape={data.shape}  '
                     f'extent={[round(v,3) for v in extent]}  '
                     f'vmin={vmin:.3g}  vmax={vmax:.3g}  '
-                    f'(symm {_CLIP_PCT}th-pct, skip={_DW_SKIP_FRAC:.0%} rows)'
+                    f'(symm {self._clip_pct:.1f}th-pct, skip={self._dw_skip_frac:.0%} rows)'
                 )
 
                 im = ax.imshow(
@@ -289,9 +320,9 @@ class MultiPanelCanvas(FigureCanvasQTAgg):
                 self._cbars.append(cb)
 
             except Exception as e:
-                LOG.error(f'Panel {idx} render error: {e}\n{traceback.format_exc()}')
+                LOG.error(f'Panel {idx} render error: {e}\\n{traceback.format_exc()}')
                 ax.text(
-                    0.5, 0.5, f'Render error:\n{e}',
+                    0.5, 0.5, f'Render error:\\n{e}',
                     ha='center', va='center',
                     color='red', fontsize=8,
                     transform=ax.transAxes,
@@ -346,6 +377,8 @@ class RadarCanvas(FigureCanvasQTAgg):
         vmin:       Optional[float] = None,
         vmax:       Optional[float] = None,
         title:      str   = 'GPR B-Scan',
+        clip_pct:   float = 98.0,
+        dw_skip_frac: float = 0.25,
     ):
         if self.colorbar is not None:
             try: self.colorbar.remove()
@@ -358,9 +391,9 @@ class RadarCanvas(FigureCanvasQTAgg):
 
         if vmin is None or vmax is None:
             n = data.shape[0]
-            skip = max(0, int(n * _DW_SKIP_FRAC))
+            skip = max(0, int(n * dw_skip_frac))
             d_sub = data[skip:, :] if n > skip + 4 else data
-            vabs  = float(np.percentile(np.abs(d_sub), _CLIP_PCT))
+            vabs  = float(np.percentile(np.abs(d_sub), clip_pct))
             if vabs < 1e-10: vabs = 1.0
             vmin, vmax = -vabs, vabs
 
