@@ -7,16 +7,32 @@ Supports IDS Stream UP (float32) and IDS Stream DP (int16) antenna types.
 
 Header format (newline-separated text lines):
   Line 1: "ogpr"
-  Line 2: UUID  (32 hex chars)
-  Line 3: data offset  (8 hex chars, used only as cross-check)
-  Remaining text: JSON descriptor  <- read by brace-balancing, NOT by byte offset
+  Line 2: MD5  (32 hex chars)
+  Line 3: JSON header size (8 decimal chars, zero-padded)
+  Remaining text: JSON descriptor (header_size bytes)
   After JSON: binary data blocks
+
+On-disk memory layout (IDS format):
+  Data is written trace-by-trace: for each slice, all channels, all samples.
+  Binary order: (slices, channels, samples)  <- C-order on disk
+  After reshape + transpose -> (samples, channels, slices)  <- viewer convention
+
+Dtype policy:
+  float32 files (IDS Stream UP): kept as float32 throughout.
+                                  Values are physical voltage units.
+  int16 files   (IDS Stream DP): kept as int16 throughout.
+                                  Values are raw ADC counts.
+  NO automatic dtype conversion is performed.
+  SignalProcessor handles each dtype natively.
 """
 
+import logging
 import json
 import numpy as np
 from pathlib import Path
 from typing import Dict, Optional
+
+LOG = logging.getLogger('ogpr_viewer')
 
 
 class OGPRParser:
@@ -27,6 +43,8 @@ class OGPRParser:
       - 'valueType': 'float'  => np.float32  (IDS Stream UP)
       - 'valueType': 'int'    => np.int16    (IDS Stream DP)
       - absent (v1)           => np.float32  (default)
+
+    The detected dtype is preserved as-is. No conversion is applied.
     """
 
     _DTYPE_MAP = {
@@ -47,6 +65,9 @@ class OGPRParser:
         self.radar_data: Optional[np.ndarray] = None
         self.geolocations: Optional[np.ndarray] = None
         self._file_size = self.filepath.stat().st_size
+        self._header_size: Optional[int] = None
+        self._json_start: int = 0
+        self._json_end: int = 0
 
     # ------------------------------------------------------------------
     # Low-level helpers
@@ -68,26 +89,18 @@ class OGPRParser:
         """
         Read exactly one complete JSON object from the current file position
         by counting opening/closing braces.
-
-        Reads byte-by-byte and decodes each byte as latin-1 so that any
-        stray non-UTF-8 byte outside the JSON string values is handled
-        safely.  Once the JSON object is complete (depth reaches 0) we stop
-        immediately — binary data beyond that point is never touched.
-
-        Returns the JSON text as a str.
         """
-        buf        = []
-        depth      = 0
-        in_string  = False
+        buf         = []
+        depth       = 0
+        in_string   = False
         escape_next = False
-        started    = False
+        started     = False
 
         while True:
             byte = f.read(1)
             if not byte:
-                break                       # EOF
-
-            ch = byte.decode('latin-1')     # safe for any byte value
+                break
+            ch = byte.decode('latin-1')
 
             if escape_next:
                 buf.append(ch)
@@ -102,7 +115,6 @@ class OGPRParser:
                     in_string = False
                 continue
 
-            # outside a string
             if ch == '"':
                 in_string = True
                 buf.append(ch)
@@ -114,11 +126,10 @@ class OGPRParser:
                 depth -= 1
                 buf.append(ch)
                 if started and depth == 0:
-                    break               # JSON object complete
+                    break
             else:
                 if started:
                     buf.append(ch)
-                # before the first '{': skip whitespace/newlines silently
 
         return ''.join(buf)
 
@@ -127,45 +138,77 @@ class OGPRParser:
     # ------------------------------------------------------------------
 
     def parse_header(self) -> Dict:
-        """
-        Parse OGPR file header and JSON descriptor.
-
-        Steps:
-          1. Read three newline-delimited ASCII lines: signature, UUID, offset.
-          2. Read JSON by brace-balancing (safe against encoding issues).
-          3. Parse JSON with json.loads().
-        """
         with open(self.filepath, 'rb') as f:
-
-            # --- line 1: signature ---
             signature = self._read_line(f)
             if signature != 'ogpr':
                 raise ValueError(
                     f"Invalid OGPR signature: '{signature}' (expected 'ogpr')"
                 )
+            _md5 = self._read_line(f)
+            header_size_str = self._read_line(f).strip()
 
-            # --- line 2: UUID ---
-            _uuid = self._read_line(f)  # noqa: F841
-
-            # --- line 3: data offset (used only for diagnostics) ---
-            offset_hex = self._read_line(f).strip()
+            # OGPR preamble (v2): 8-digit decimal JSON header size.
+            # Fallback to hex for non-standard files found in the wild.
+            header_size = None
             try:
-                self._data_offset = int(offset_hex, 16)
-            except ValueError as exc:
-                raise ValueError(
-                    f"Cannot parse data offset '{offset_hex}' as hex: {exc}"
-                ) from exc
+                header_size = int(header_size_str, 10)
+            except ValueError:
+                try:
+                    header_size = int(header_size_str, 16)
+                    LOG.warning(
+                        f"Header size '{header_size_str}' parsed as hex fallback."
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        f"Cannot parse JSON header size '{header_size_str}' "
+                        f"(expected decimal 8 chars)."
+                    ) from exc
 
-            # --- JSON: read by brace-balancing ---
-            json_text = self._read_json_by_braces(f)
+            self._header_size = int(max(0, header_size))
+            self._json_start = int(f.tell())
+
+            json_text = ''
+            if self._header_size > 0:
+                raw = f.read(self._header_size)
+                json_text = raw.decode('utf-8', errors='strict').strip('\x00\r\n\t ')
+            self._json_end = int(f.tell())
+
+            # Safety fallback when size-based read fails or is empty.
+            if not json_text.startswith('{'):
+                LOG.warning(
+                    'JSON header not found via declared header size; '
+                    'falling back to brace-balanced parsing.'
+                )
+                f.seek(self._json_start)
+                json_text = self._read_json_by_braces(f)
+                self._json_end = int(f.tell())
 
         if not json_text:
             raise ValueError("No JSON descriptor found in file.")
-
         try:
             self.descriptor = json.loads(json_text)
         except json.JSONDecodeError as exc:
             raise ValueError(f"Invalid JSON descriptor: {exc}") from exc
+
+        # Cross-check: first binary block should start at json_end.
+        try:
+            offs = [int(b.get('byteOffset', -1)) for b in self.descriptor.get('dataBlockDescriptors', [])]
+            offs = [o for o in offs if o >= 0]
+            if offs:
+                first_off = min(offs)
+                if first_off != self._json_end:
+                    LOG.warning(
+                        f'Header end mismatch: parsed json_end={self._json_end}, '
+                        f'first block byteOffset={first_off}. '
+                        'Using byteOffset from descriptor for data access.'
+                    )
+        except Exception:
+            pass
+
+        LOG.debug(
+            f'Preamble parsed: header_size={self._header_size} '
+            f'json_start={self._json_start} json_end={self._json_end}'
+        )
 
         return self.descriptor
 
@@ -177,7 +220,10 @@ class OGPRParser:
         for block in self.descriptor['dataBlockDescriptors']:
             if block['type'] == 'Radar Volume':
                 vtype = block.get('valueType', 'float').lower()
-                return self._DTYPE_MAP.get(vtype, np.float32)
+                dtype = self._DTYPE_MAP.get(vtype, np.float32)
+                LOG.debug(f'dtype detection: valueType="{vtype}" -> {dtype.__name__}')
+                return dtype
+        LOG.warning('No Radar Volume block found in descriptor, defaulting to float32')
         return np.float32
 
     # ------------------------------------------------------------------
@@ -207,8 +253,11 @@ class OGPRParser:
             'swath_name':       main.get('metadata', {}).get('swathName', 'Unknown'),
             'array_id':         main.get('metadata', {}).get('arrayId', 0),
             'version':          self.descriptor.get('version', {'major': 1, 'minor': 0}),
-            'dtype':            dtype,
-            'dtype_name':       'float32' if dtype == np.float32 else 'int16',
+            'dtype':            dtype.__name__,
+            'dtype_name':       dtype.__name__,
+            'json_header_size': self._header_size,
+            'json_start':       self._json_start,
+            'json_end':         self._json_end,
         }
 
     # ------------------------------------------------------------------
@@ -234,28 +283,65 @@ class OGPRParser:
         itemsize = self._DTYPE_BYTES[dtype]
 
         expected = samples * channels * slices * itemsize
-        if byte_size != expected:
-            print(
-                f"[OGPR] Warning: expected {expected} bytes for "
-                f"{dtype.__name__} volume, got {byte_size}."
-            )
 
-        shape = (samples, channels, slices)
+        LOG.debug(
+            f'Radar Volume block: byteOffset={byte_offset}  byteSize={byte_size}  '
+            f'expected={expected}  dtype={dtype.__name__}  '
+            f'shape=({samples},{channels},{slices})'
+        )
+
+        if byte_size != expected:
+            other_dtype    = np.int16   if dtype == np.float32 else np.float32
+            other_bytes    = self._DTYPE_BYTES[other_dtype]
+            other_expected = samples * channels * slices * other_bytes
+
+            if byte_size == other_expected:
+                LOG.warning(
+                    f'byte_size mismatch: descriptor says {dtype.__name__} '
+                    f'(expected {expected} bytes) but byte_size={byte_size} '
+                    f'matches {other_dtype.__name__}. Switching dtype.'
+                )
+                dtype    = other_dtype
+                itemsize = self._DTYPE_BYTES[dtype]
+            else:
+                LOG.warning(
+                    f'byte_size mismatch: expected {expected} bytes for '
+                    f'{dtype.__name__}, got {byte_size}. Data may be corrupt.'
+                )
+
+        # IDS on-disk layout: (slices, channels, samples) - C-order
+        # Transpose to viewer convention: (samples, channels, slices)
+        disk_shape = (slices, channels, samples)
 
         if lazy:
-            data = np.memmap(
+            raw  = np.memmap(
                 self.filepath, dtype=dtype, mode='r',
-                offset=byte_offset, shape=shape
+                offset=byte_offset, shape=disk_shape
+            )
+            data = np.transpose(raw, (2, 1, 0))
+            LOG.debug(
+                f'memmap loaded: disk_shape={disk_shape} '
+                f'-> transposed viewer_shape={data.shape}  dtype={data.dtype}'
             )
         else:
             with open(self.filepath, 'rb') as f:
                 f.seek(byte_offset)
                 raw = f.read(byte_size)
-            data = np.frombuffer(raw, dtype=dtype).reshape(shape)
+            data = np.frombuffer(raw, dtype=dtype).reshape(disk_shape)
+            data = np.ascontiguousarray(np.transpose(data, (2, 1, 0)))
+            LOG.debug(
+                f'loaded: disk_shape={disk_shape} '
+                f'-> transposed viewer_shape={data.shape}  dtype={data.dtype}'
+            )
 
-        # Always process as float32
-        if dtype == np.int16:
-            data = data.astype(np.float32)
+        # DTYPE POLICY: no conversion here.
+        # float32 stays float32 (Stream UP physical voltage)
+        # int16   stays int16   (Stream DP raw ADC counts)
+        # SignalProcessor handles both natively.
+        LOG.info(
+            f'Radar volume loaded: shape={data.shape}  dtype={data.dtype}  '
+            f'(NO dtype conversion applied)'
+        )
 
         self.radar_data = data
         return data
@@ -299,7 +385,7 @@ class OGPRParser:
                 self.geolocations = data.reshape(shape)
                 return self.geolocations
 
-        print(f"[OGPR] Warning: geolocations size {data.size} doesn't match known shapes.")
+        LOG.warning(f'Geolocations size {data.size} does not match any known shape')
         self.geolocations = data
         return data
 
