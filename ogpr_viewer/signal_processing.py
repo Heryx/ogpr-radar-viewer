@@ -400,10 +400,13 @@ class SignalProcessor:
     def correct_time_zero(
         self,
         method:    Literal['threshold', 'max', 'xcorr'] = 'threshold',
-        threshold: float = 0.1,
+        threshold: float = 0.33,
         offset_mode: Literal['scan', 'line'] = 'scan',
         max_shift_smp: Optional[int] = None,
     ) -> np.ndarray:
+        # Clamp threshold to physically meaningful range.
+        # Values above 0.30 are allowed but logged as informational.
+        threshold = float(np.clip(float(threshold), 0.02, 0.50))
         data  = self._as_f32()
         n_smp = data.shape[0]
         n_trc = data.shape[1]
